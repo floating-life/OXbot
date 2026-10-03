@@ -1,0 +1,392 @@
+{
+  "architecture": "oxbot-causal-candidate-v1",
+  "config": {
+    "vocabulary": 128,
+    "history_length": 256,
+    "width": 64,
+    "layers": 2,
+    "heads": 4,
+    "feedforward": 256,
+    "state_features": 128,
+    "action_features": 128,
+    "layer_norm_epsilon": 1e-05,
+    "architecture": "oxbot-causal-candidate-v1"
+  },
+  "feature_version": "oxbot-observation-v1",
+  "rules_contract": "botzone-corrected-fa63589d-v1",
+  "dtype": "float32-le",
+  "tensors": [
+    {
+      "name": "embedding.weight",
+      "shape": [
+        128,
+        64
+      ],
+      "count": 8192,
+      "offset": 0
+    },
+    {
+      "name": "position.weight",
+      "shape": [
+        256,
+        64
+      ],
+      "count": 16384,
+      "offset": 32768
+    },
+    {
+      "name": "blocks.0.norm1.weight",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 98304
+    },
+    {
+      "name": "blocks.0.norm1.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 98560
+    },
+    {
+      "name": "blocks.0.qkv.weight",
+      "shape": [
+        192,
+        64
+      ],
+      "count": 12288,
+      "offset": 98816
+    },
+    {
+      "name": "blocks.0.qkv.bias",
+      "shape": [
+        192
+      ],
+      "count": 192,
+      "offset": 147968
+    },
+    {
+      "name": "blocks.0.projection.weight",
+      "shape": [
+        64,
+        64
+      ],
+      "count": 4096,
+      "offset": 148736
+    },
+    {
+      "name": "blocks.0.projection.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 165120
+    },
+    {
+      "name": "blocks.0.norm2.weight",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 165376
+    },
+    {
+      "name": "blocks.0.norm2.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 165632
+    },
+    {
+      "name": "blocks.0.ff1.weight",
+      "shape": [
+        256,
+        64
+      ],
+      "count": 16384,
+      "offset": 165888
+    },
+    {
+      "name": "blocks.0.ff1.bias",
+      "shape": [
+        256
+      ],
+      "count": 256,
+      "offset": 231424
+    },
+    {
+      "name": "blocks.0.ff2.weight",
+      "shape": [
+        64,
+        256
+      ],
+      "count": 16384,
+      "offset": 232448
+    },
+    {
+      "name": "blocks.0.ff2.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 297984
+    },
+    {
+      "name": "blocks.1.norm1.weight",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 298240
+    },
+    {
+      "name": "blocks.1.norm1.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 298496
+    },
+    {
+      "name": "blocks.1.qkv.weight",
+      "shape": [
+        192,
+        64
+      ],
+      "count": 12288,
+      "offset": 298752
+    },
+    {
+      "name": "blocks.1.qkv.bias",
+      "shape": [
+        192
+      ],
+      "count": 192,
+      "offset": 347904
+    },
+    {
+      "name": "blocks.1.projection.weight",
+      "shape": [
+        64,
+        64
+      ],
+      "count": 4096,
+      "offset": 348672
+    },
+    {
+      "name": "blocks.1.projection.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 365056
+    },
+    {
+      "name": "blocks.1.norm2.weight",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 365312
+    },
+    {
+      "name": "blocks.1.norm2.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 365568
+    },
+    {
+      "name": "blocks.1.ff1.weight",
+      "shape": [
+        256,
+        64
+      ],
+      "count": 16384,
+      "offset": 365824
+    },
+    {
+      "name": "blocks.1.ff1.bias",
+      "shape": [
+        256
+      ],
+      "count": 256,
+      "offset": 431360
+    },
+    {
+      "name": "blocks.1.ff2.weight",
+      "shape": [
+        64,
+        256
+      ],
+      "count": 16384,
+      "offset": 432384
+    },
+    {
+      "name": "blocks.1.ff2.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 497920
+    },
+    {
+      "name": "final_norm.weight",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 498176
+    },
+    {
+      "name": "final_norm.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 498432
+    },
+    {
+      "name": "state_projection.weight",
+      "shape": [
+        64,
+        128
+      ],
+      "count": 8192,
+      "offset": 498688
+    },
+    {
+      "name": "state_projection.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 531456
+    },
+    {
+      "name": "action_projection.weight",
+      "shape": [
+        64,
+        128
+      ],
+      "count": 8192,
+      "offset": 531712
+    },
+    {
+      "name": "action_projection.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 564480
+    },
+    {
+      "name": "head1.weight",
+      "shape": [
+        64,
+        192
+      ],
+      "count": 12288,
+      "offset": 564736
+    },
+    {
+      "name": "head1.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 613888
+    },
+    {
+      "name": "head2.weight",
+      "shape": [
+        1,
+        64
+      ],
+      "count": 64,
+      "offset": 614144
+    },
+    {
+      "name": "head2.bias",
+      "shape": [
+        1
+      ],
+      "count": 1,
+      "offset": 614400
+    }
+  ],
+  "selection": {
+    "schema": "oxbot-selection-v1",
+    "default": "raw",
+    "supported": [
+      "raw",
+      "raw-pass-bias",
+      "group-logmeanexp"
+    ],
+    "pass_bias": -0.5,
+    "group_definition": {
+      "key": "kind,length,key,secondary,rank-count multiset,wildcard count",
+      "wildcard": "heart face at current level",
+      "straight_flush": "full canonical face-count/suit signature retained",
+      "aggregation": "logmeanexp(raw member scores)",
+      "member": "highest raw score within selected group"
+    }
+  },
+  "model_version": "research-rollout-q-train32",
+  "payload_sha256": "d6ea948ebc6a6b3b3b9ba5f9d1c8e81fd50129e3225e33ff906338dd4d9c8144",
+  "provenance": {
+    "schema": "oxbot-rollout-q-training-v1",
+    "seed": 20261003,
+    "train_jsonl": "/mnt/d/coding/OXbot/data/selfplay/candidate_rollouts_train32.jsonl",
+    "train_jsonl_sha256": "8561a4f39da40b0e4331c476be2c78000ec94e53d9a63f31a4a97e3f635e2dbe",
+    "validation_jsonl": "/mnt/d/coding/OXbot/data/selfplay/candidate_rollouts_val16.jsonl",
+    "validation_jsonl_sha256": "d75defbade4922a1cbfe648bbe0ab9c420891f8a89bd7ed2e3a8a9d0781d4fdb",
+    "train_report": "/mnt/d/coding/OXbot/reports/selfplay_candidate_rollouts_train32.json",
+    "train_report_sha256": "c4a9df5d28ab54cead1e4b9b1fb792c95094f4daec144e0260f24c0ada90c80d",
+    "validation_report": "/mnt/d/coding/OXbot/reports/selfplay_candidate_rollouts_val16.json",
+    "validation_report_sha256": "e25a4cf05bc8c7bdfbe589111f5001fd7c6800cecea56e0cf54affc4bb10ce09",
+    "train_rows": 384,
+    "validation_rows": 192,
+    "init_checkpoint": "/mnt/d/coding/OXbot/models/bc-v2-full-fp32/best.pt",
+    "init_checkpoint_sha256": "5661204b6b286bc17af6f847443cb72cfbbad8574568d32096b53ac75869cd82",
+    "train_script_sha256": "2ded5d1095465e36e082a1997c76bf8bc1b48f07b44a4b716c2209da311b40e1",
+    "model_script_sha256": "1a8ac05cd3d3e30403b5c0cd4839fd2b779331413c058481032c03661f47eb63",
+    "torch": "2.11.0+cu128",
+    "device": "cuda",
+    "epochs_requested": 4,
+    "batch_size": 16,
+    "learning_rate": 5e-05,
+    "pair_weight": 1.0,
+    "value_weight": 0.1,
+    "bc_weight": 0.1,
+    "max_pairs": 64,
+    "margin": 0.1,
+    "test_used": false,
+    "release_artifact": false,
+    "q_definition": "fixed-policy terminal team margin from forced candidate; larger margin ranks higher",
+    "selected_epoch": 4,
+    "validation": {
+      "rows": 192,
+      "pairs": 385,
+      "pair_correct": 193,
+      "pair_rows": 103,
+      "labels": 515,
+      "value_abs_error": 653.7441940307617,
+      "selected": 90,
+      "selected_best": 106,
+      "pair_accuracy": 0.5012987012987012,
+      "value_mae": 1.2694062020014791,
+      "selected_accuracy": 0.46875,
+      "selected_is_q_best": 0.5520833333333334
+    },
+    "selection_objective": 0.5621716088013727,
+    "optimizer_steps": 96
+  },
+  "file_sha256": "0dabaa77ebaed4c5257aac80a0644ccea84cd611bca85de3ba16d6ed5dc0bf83",
+  "bytes": 619833,
+  "file": "oxbot-research-rollout-q-train32.bin"
+}

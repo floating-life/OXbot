@@ -1,0 +1,16 @@
+{
+  "corrected_copy": {
+    "path": "../裁判代码-修正版.py",
+    "sha256": "FA63589D3F69CE9127093CEC417F1635D8CC17205D80E70F03E44BC6809FC622",
+    "status": "available_for_offline_audit"
+  },
+  "online_original": {
+    "path": "../reports/official_judge_botzone_2026-10-02.py",
+    "sha256": "49a7346ddc0a06ebd8922e582d535fbc6fb5418ddea16b023a5f3384fc9b6fd9",
+    "source_url": "https://www.botzone.org.cn/game/GuanDan",
+    "judge_endpoint": "https://www.botzone.org.cn/game/viewsrc?typ=judge&game=65490c16ec1ab1389702dced&download=true",
+    "game_id": "65490c16ec1ab1389702dced",
+    "retrieved_at": "2026-10-02 Asia/Shanghai",
+    "status": "obtained_from_authenticated_game_page"
+  }
+}

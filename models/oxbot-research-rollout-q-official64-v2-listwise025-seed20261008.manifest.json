@@ -1,0 +1,407 @@
+{
+  "architecture": "oxbot-causal-candidate-v1",
+  "config": {
+    "vocabulary": 128,
+    "history_length": 256,
+    "width": 64,
+    "layers": 2,
+    "heads": 4,
+    "feedforward": 256,
+    "state_features": 128,
+    "action_features": 128,
+    "layer_norm_epsilon": 1e-05,
+    "architecture": "oxbot-causal-candidate-v1"
+  },
+  "feature_version": "oxbot-observation-v1",
+  "rules_contract": "botzone-corrected-fa63589d-v1",
+  "dtype": "float32-le",
+  "tensors": [
+    {
+      "name": "embedding.weight",
+      "shape": [
+        128,
+        64
+      ],
+      "count": 8192,
+      "offset": 0
+    },
+    {
+      "name": "position.weight",
+      "shape": [
+        256,
+        64
+      ],
+      "count": 16384,
+      "offset": 32768
+    },
+    {
+      "name": "blocks.0.norm1.weight",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 98304
+    },
+    {
+      "name": "blocks.0.norm1.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 98560
+    },
+    {
+      "name": "blocks.0.qkv.weight",
+      "shape": [
+        192,
+        64
+      ],
+      "count": 12288,
+      "offset": 98816
+    },
+    {
+      "name": "blocks.0.qkv.bias",
+      "shape": [
+        192
+      ],
+      "count": 192,
+      "offset": 147968
+    },
+    {
+      "name": "blocks.0.projection.weight",
+      "shape": [
+        64,
+        64
+      ],
+      "count": 4096,
+      "offset": 148736
+    },
+    {
+      "name": "blocks.0.projection.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 165120
+    },
+    {
+      "name": "blocks.0.norm2.weight",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 165376
+    },
+    {
+      "name": "blocks.0.norm2.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 165632
+    },
+    {
+      "name": "blocks.0.ff1.weight",
+      "shape": [
+        256,
+        64
+      ],
+      "count": 16384,
+      "offset": 165888
+    },
+    {
+      "name": "blocks.0.ff1.bias",
+      "shape": [
+        256
+      ],
+      "count": 256,
+      "offset": 231424
+    },
+    {
+      "name": "blocks.0.ff2.weight",
+      "shape": [
+        64,
+        256
+      ],
+      "count": 16384,
+      "offset": 232448
+    },
+    {
+      "name": "blocks.0.ff2.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 297984
+    },
+    {
+      "name": "blocks.1.norm1.weight",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 298240
+    },
+    {
+      "name": "blocks.1.norm1.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 298496
+    },
+    {
+      "name": "blocks.1.qkv.weight",
+      "shape": [
+        192,
+        64
+      ],
+      "count": 12288,
+      "offset": 298752
+    },
+    {
+      "name": "blocks.1.qkv.bias",
+      "shape": [
+        192
+      ],
+      "count": 192,
+      "offset": 347904
+    },
+    {
+      "name": "blocks.1.projection.weight",
+      "shape": [
+        64,
+        64
+      ],
+      "count": 4096,
+      "offset": 348672
+    },
+    {
+      "name": "blocks.1.projection.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 365056
+    },
+    {
+      "name": "blocks.1.norm2.weight",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 365312
+    },
+    {
+      "name": "blocks.1.norm2.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 365568
+    },
+    {
+      "name": "blocks.1.ff1.weight",
+      "shape": [
+        256,
+        64
+      ],
+      "count": 16384,
+      "offset": 365824
+    },
+    {
+      "name": "blocks.1.ff1.bias",
+      "shape": [
+        256
+      ],
+      "count": 256,
+      "offset": 431360
+    },
+    {
+      "name": "blocks.1.ff2.weight",
+      "shape": [
+        64,
+        256
+      ],
+      "count": 16384,
+      "offset": 432384
+    },
+    {
+      "name": "blocks.1.ff2.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 497920
+    },
+    {
+      "name": "final_norm.weight",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 498176
+    },
+    {
+      "name": "final_norm.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 498432
+    },
+    {
+      "name": "state_projection.weight",
+      "shape": [
+        64,
+        128
+      ],
+      "count": 8192,
+      "offset": 498688
+    },
+    {
+      "name": "state_projection.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 531456
+    },
+    {
+      "name": "action_projection.weight",
+      "shape": [
+        64,
+        128
+      ],
+      "count": 8192,
+      "offset": 531712
+    },
+    {
+      "name": "action_projection.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 564480
+    },
+    {
+      "name": "head1.weight",
+      "shape": [
+        64,
+        192
+      ],
+      "count": 12288,
+      "offset": 564736
+    },
+    {
+      "name": "head1.bias",
+      "shape": [
+        64
+      ],
+      "count": 64,
+      "offset": 613888
+    },
+    {
+      "name": "head2.weight",
+      "shape": [
+        1,
+        64
+      ],
+      "count": 64,
+      "offset": 614144
+    },
+    {
+      "name": "head2.bias",
+      "shape": [
+        1
+      ],
+      "count": 1,
+      "offset": 614400
+    }
+  ],
+  "selection": {
+    "schema": "oxbot-selection-v1",
+    "default": "raw",
+    "supported": [
+      "raw",
+      "raw-pass-bias",
+      "group-logmeanexp"
+    ],
+    "pass_bias": -0.5,
+    "group_definition": {
+      "key": "kind,length,key,secondary,rank-count multiset,wildcard count",
+      "wildcard": "heart face at current level",
+      "straight_flush": "full canonical face-count/suit signature retained",
+      "aggregation": "logmeanexp(raw member scores)",
+      "member": "highest raw score within selected group"
+    }
+  },
+  "model_version": "research-rollout-q-official64-v2-listwise025-seed20261008",
+  "payload_sha256": "a83afafb9b4f3738b6e5f9c460bf8c3e090abbe1e0561f44745498f7ad6709c8",
+  "provenance": {
+    "schema": "oxbot-rollout-q-training-v1",
+    "seed": 20261008,
+    "train_jsonl": "/mnt/d/coding/OXbot/data/selfplay/official_rollouts_train64.jsonl",
+    "train_jsonl_sha256": "94dee48fae37b92e13be290e4f44cc18160f8d03c1c696dda3be53e264df13b4",
+    "validation_jsonl": "/mnt/d/coding/OXbot/data/selfplay/official_rollouts_val32.jsonl",
+    "validation_jsonl_sha256": "e16052ca571d521fc58efc6b946f88fecb096c9a05f18dea8583081213c81531",
+    "train_report": "/mnt/d/coding/OXbot/reports/official_rollouts_train64.json",
+    "train_report_sha256": "028cd8096d9c428dc66a1d372a9796f96db9a9fec2c87e4891ae2e87873a2452",
+    "validation_report": "/mnt/d/coding/OXbot/reports/official_rollouts_val32.json",
+    "validation_report_sha256": "a6800877775d9aa0ddb3991faca8ba7bac866663312a4f747de05c5d6522ecfc",
+    "train_rows": 768,
+    "train_rollout_rules_contract": "botzone-official-910cba94-v1",
+    "train_oracle_sha256": "910cba94244106b68535b8bee67631b476241a9924bd1789dacbbf217fb1e895",
+    "validation_rollout_rules_contract": "botzone-official-910cba94-v1",
+    "validation_oracle_sha256": "910cba94244106b68535b8bee67631b476241a9924bd1789dacbbf217fb1e895",
+    "train_game_count": 64,
+    "validation_game_count": 32,
+    "train_deal_count": 64,
+    "validation_deal_count": 32,
+    "validation_rows": 384,
+    "init_checkpoint": "/mnt/d/coding/OXbot/models/bc-v2-full-fp32/best.pt",
+    "init_checkpoint_sha256": "5661204b6b286bc17af6f847443cb72cfbbad8574568d32096b53ac75869cd82",
+    "train_script_sha256": "bfa0e6faeb0f56f4a042004ddf5ff9f0dc530330a0448a1aac732e4ac137c317",
+    "model_script_sha256": "1a8ac05cd3d3e30403b5c0cd4839fd2b779331413c058481032c03661f47eb63",
+    "torch": "2.11.0+cu128",
+    "device": "cuda",
+    "epochs_requested": 8,
+    "batch_size": 32,
+    "learning_rate": 5e-05,
+    "pair_weight": 1.0,
+    "value_weight": 0.1,
+    "bc_weight": 0.1,
+    "max_pairs": 64,
+    "margin": 0.1,
+    "listwise_weight": 0.25,
+    "listwise_beta": 2.0,
+    "listwise_behavior_mix": 0.25,
+    "test_used": false,
+    "release_artifact": false,
+    "q_definition": "fixed-policy terminal team margin from forced candidate; larger margin ranks higher",
+    "selected_epoch": 7,
+    "validation": {
+      "rows": 384,
+      "pairs": 693,
+      "pair_correct": 371,
+      "pair_rows": 191,
+      "labels": 1022,
+      "value_abs_error": 1038.3570709228516,
+      "selected": 200,
+      "selected_best": 228,
+      "listwise_rows": 238,
+      "listwise_nll": 1.3770974203318107,
+      "labelled_best": 141,
+      "pair_accuracy": 0.5353535353535354,
+      "value_mae": 1.0160049617640425,
+      "selected_accuracy": 0.5208333333333334,
+      "selected_is_q_best": 0.59375,
+      "labelled_best_accuracy": 0.592436974789916
+    },
+    "selection_objective": 0.5154467127346668,
+    "optimizer_steps": 168
+  },
+  "file_sha256": "a0beebca90c836b693cae7a2226a87bea0e8b6930b9de6c761d01c4fe8c03a39",
+  "bytes": 620445,
+  "file": "oxbot-research-rollout-q-official64-v2-listwise025-seed20261008.bin"
+}

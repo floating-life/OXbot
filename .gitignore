@@ -1,0 +1,21 @@
+__pycache__/
+/.pytest_cache/
+/.pytest_tmp/
+*.py[cod]
+bin/
+build/
+dist/
+data/
+reports/
+.venv/
+*.pt
+*.bin
+*.npz
+*.core
+
+# Local browser captures and temporary BotZone/Codex inspection artifacts.
+*.tmp.html
+tmp__*
+tmp_git_*
+wiki_*.html
+matchview.tmp.js
