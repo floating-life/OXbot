@@ -70,6 +70,34 @@ scripts\train_5080.bat
 
 （本包已把自博弈进程提速约 2.3 倍；30,772 个局面上的牌型枚举、特征和分词与基线逐位一致，有测试 `tests\test_fast_paths.py` 保证。推理端仍保留 512 个合法动作上限，用于控制 Botzone 内存。）
 
+### 一键：从 real-v2 长时自博弈 + duplicate 评测（推荐）
+
+`scripts/selfplay_eval_5080_wsl.sh` 把“训练 → 冻结候选 → 评测 → 晋级”串成一条命令：
+
+```bash
+bash scripts/selfplay_eval_5080_wsl.sh                 # 默认训练 24 小时，然后评测
+OXBOT_HOURS=48 bash scripts/selfplay_eval_5080_wsl.sh  # 训练 48 小时
+bash scripts/selfplay_eval_5080_wsl.sh eval            # 只评测当前 latest.npz
+# 冒烟测试（几分钟）：
+OXBOT_HOURS=0.1 OXBOT_DEALS=20 OXBOT_JUDGE_GAMES=8 OXBOT_OUT=ckpts/dmc-smoke \
+    bash scripts/selfplay_eval_5080_wsl.sh
+```
+
+Windows PowerShell：`.\competition\scripts\selfplay_eval_5080.ps1 -Hours 24`。
+
+1. **训练**：用 `ckpts/real-v2/best.pt` 做 `--warm-start`，跑 `train_fast` 的 DMC 自博弈，`--ladder-frac 0.5`。
+   输出到 `ckpts/dmc-realv2`。再次运行会从 `latest.pt` 续训，按 Ctrl+C 中断是安全的。
+2. **评测**：复制一份 `latest.npz` 冻结为候选，然后用 `tools/duplicate_eval.py` 多进程跑 1,000 副同牌换座（2,000 局）。
+   对手依次是 real-v2 BC、规则机器人，以及已存在的冠军。统计单位是“副牌”，报告配对 bootstrap 95% 置信区间。
+   评测 seed 固定，保证不同候选面对同一套牌。
+3. **合法性**：用官方裁判跑 200 局（覆盖所有进贡场景），并加 `--require-model`。
+4. **晋级只看一条规则**：对 real-v2 和对现任冠军的置信区间都完全大于 0，且裁判 0 错误，才写入
+   `ckpts/dmc-realv2/champion/`。否则保持现任冠军，32 局级别的结果不作数。
+
+报告都在 `ckpts/dmc-realv2/eval/<时间戳>/`（`vs_*.json`、`judge.json`、`summary.json`）。
+晋级后，按 [C++ 迁移说明](../../docs/fabledan_cpp.md) 导出 FBDN，再运行 `check_submission.py`。
+旧 OXGDQ001 的 cf8 线上包走的是 C++ 引擎，暂时不能和本工具直接对打。要和线上版本比较，需要单独做跨引擎评测。
+
 ## 2. 看哪些数
 
 - `eval vs rule: xx%`：对内置规则机器人的胜率。第一阶段目标 **≥ 95%**（日志会打印"里程碑"），之后会饱和，不再有参考价值。
