@@ -75,6 +75,37 @@ def tokenize(events, viewer, level):
     return toks
 
 
+def tokenize_cached(events, viewer, level, cache):
+    """Same output as tokenize(), but only tokenizes events appended since
+    the previous call for this viewer.  `cache` is a per-game dict that must
+    be reset whenever a new round starts (events only ever grow)."""
+    ent = cache.get(viewer)
+    if ent is None or ent[0] > len(events) or ent[2] != level:
+        ent = [0, [BOS_TOK, LEVEL_BASE + level], level]
+        cache[viewer] = ent
+    toks = ent[1]
+    for ev in events[ent[0]:]:
+        kind = ev[0]
+        p = (ev[1] - viewer) % 4
+        if kind == 'pass':
+            toks.append(PLAYER_BASE + p)
+            toks.append(TYPE_BASE + PASS)
+        elif kind == 'play':
+            mv = ev[2]
+            toks.append(PLAYER_BASE + p)
+            toks.append(TYPE_BASE + mv.type)
+            for r in sorted(mv.claim_ranks):
+                toks.append(RANK_BASE + r)
+        elif kind == 'tribute':
+            toks += [PLAYER_BASE + p, TRIBUTE_TOK, RANK_BASE + ev[2]]
+        elif kind == 'return':
+            toks += [PLAYER_BASE + p, RETURN_TOK, RANK_BASE + ev[2]]
+    ent[0] = len(events)
+    if len(toks) > MAX_SEQ:
+        return toks[:2] + toks[-(MAX_SEQ - 2):]
+    return list(toks)
+
+
 def hand_action_features(obs, move):
     """69-dim float32 features for (state-side hand info, candidate move)."""
     lv = obs["level"]
@@ -112,10 +143,74 @@ def hand_action_features(obs, move):
     return f
 
 
-def encode_decision(obs):
-    """-> (tokens list[int], feats ndarray [n_legal, FEAT_DIM])"""
-    toks = tokenize(obs["events"], obs["player"], obs["level"])
-    feats = np.stack([hand_action_features(obs, m) for m in obs["legal"]])
+# offsets of the per-move block inside the feature vector
+_OFF_MTYPE = 15 + 1 + 1 + 4 + 4 + 13          # 38: action type one-hot
+_OFF_MCLAIM = _OFF_MTYPE + N_TYPES             # 49: claim rank counts
+_OFF_MSIZE = _OFF_MCLAIM + 15                  # 64
+_OFF_MWILD = _OFF_MSIZE + 1                    # 65
+_OFF_MKEY = _OFF_MWILD + 1                     # 66
+_OFF_LEAD = _OFF_MKEY + 1                      # 67: lead block (state side)
+
+
+def _state_features(obs):
+    """The state-side part of hand_action_features (identical values)."""
+    lv = obs["level"]
+    me = obs["player"]
+    f = np.zeros(FEAT_DIM, dtype=np.float32)
+    hand = obs["hand"]
+    for c in hand:
+        f[rank_of(c)] += 0.25
+    i = 15
+    f[i] = sum(1 for c in hand if is_wildcard(c, lv)) / 2.0; i += 1
+    f[i] = len(hand) / 27.0; i += 1
+    left = obs["left"]
+    for rel in range(4):
+        f[i + rel] = left[(me + rel) % 4] / 27.0
+    i += 4
+    done = obs["done"]
+    for rel in range(4):
+        f[i + rel] = 1.0 if done[(me + rel) % 4] else 0.0
+    i += 4
+    f[i + lv] = 1.0
+    lead = obs["lead"]
+    if lead is not None and lead.type != PASS:
+        f[_OFF_LEAD + lead.type] = 1.0
+        f[_OFF_LEAD + N_TYPES] = lead.key / 15.0
+        f[_OFF_LEAD + N_TYPES + 1] = 0.0
+    else:
+        f[_OFF_LEAD + N_TYPES + 1] = 1.0  # leading
+    return f
+
+
+def encode_decision(obs, tok_cache=None):
+    """-> (tokens list[int], feats ndarray [n_legal, FEAT_DIM])
+
+    Fast path: the state-side features are computed once per decision and
+    only the per-move block is filled per legal move.  Output is bit-for-bit
+    identical to stacking hand_action_features(obs, m) (see tests).
+    `tok_cache` (optional, per game): incremental tokenization."""
+    if tok_cache is None:
+        toks = tokenize(obs["events"], obs["player"], obs["level"])
+    else:
+        toks = tokenize_cached(obs["events"], obs["player"], obs["level"],
+                               tok_cache)
+    legal = obs["legal"]
+    lv = obs["level"]
+    base = _state_features(obs)
+    feats = np.empty((len(legal), FEAT_DIM), dtype=np.float32)
+    feats[:] = base
+    for j, move in enumerate(legal):
+        row = feats[j]
+        row[_OFF_MTYPE + move.type] = 1.0
+        for r in move.claim_ranks:
+            row[_OFF_MCLAIM + r] += 0.25
+        row[_OFF_MSIZE] = move.size / 27.0
+        nw = 0
+        for c in move.cards:
+            if c % 54 < 52 and (c % 54) // 4 == lv and (c % 54) % 4 == 0:
+                nw += 1
+        row[_OFF_MWILD] = nw / 2.0
+        row[_OFF_MKEY] = (move.key / 15.0) if move.type != PASS else 0.0
     return toks, feats
 
 

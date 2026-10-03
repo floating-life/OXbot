@@ -16,7 +16,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from fabledan.cards import RANK_NAMES, level_rank, order_of, rank_of, is_wildcard
+from fabledan.cards import RANK_NAMES, level_rank, level_str_botzone, order_of, rank_of, is_wildcard
 from fabledan.combos import PASS, beats, classify_claim, gen_moves
 from fabledan.engine import partner, forced_tribute_card
 from fabledan.cards import BJ
@@ -116,53 +116,69 @@ def run_game(bot_cmds, seed, level_str="2", tribute_mode=None, verbose=False,
         assert r == [], "deal response must be []"
 
     lead_player = 0
-    # --- tribute phase ---
+    # --- tribute phase (official-judge semantics, incl. resist requests,
+    #     clockwise tie assignment and the judge's lead-player rules) ---
     if n_trib:
         payers = [last] if n_trib == 1 else [last, partner(last)]
         receivers = [first] if n_trib == 1 else [first, partner(first)]
         n_bj = sum(1 for p in payers for c in hands[p] if rank_of(c) == BJ)
-        if n_bj >= 2:
-            resist = True
-            lead_player = first
-            for p in payers:
+        resist = n_bj >= 2
+        orig = [list(h) for h in hands]      # judge validates vs the deal
+        got = {}
+        for p in payers:
+            gg = dict(g); gg["tribute_cards"] = {str(k): v for k, v in tribute_cards.items()}
+            gg["return_cards"] = {}; gg["resist"] = resist
+            r = bots[p].turn({"stage": "tribute", "global": gg})
+            if resist:
+                assert r == [], "resist: tribute response must be []"
                 tribute_cards[str(p)] = -1
+                continue
+            card = r[0]
+            exp = forced_tribute_card(hands[p], lv)
+            assert order_of(rank_of(card), lv) == order_of(rank_of(exp), lv), \
+                "tribute card not max: %s vs %s" % (card, exp)
+            assert card in hands[p] and not is_wildcard(card, lv)
+            hands[p].remove(card)
+            tribute_cards[str(p)] = card
+            got[p] = card
+        if resist:
+            for recv in receivers:
+                gg = dict(g)
+                gg["tribute_cards"] = {str(k): v for k, v in tribute_cards.items()}
+                gg["return_cards"] = {str(k): v for k, v in return_cards.items()}
+                gg["resist"] = True
+                r = bots[recv].turn({"stage": "return", "global": gg})
+                assert r == [], "resist: return response must be []"
+                return_cards[str(recv)] = -1
+            lead_player = first
         else:
-            got = {}
-            for p in payers:
-                gg = dict(g); gg["tribute_cards"] = {str(k): v for k, v in tribute_cards.items()}
-                gg["return_cards"] = {}; gg["resist"] = False
-                r = bots[p].turn({"stage": "tribute", "global": gg})
-                card = r[0]
-                exp = forced_tribute_card(hands[p], lv)
-                assert order_of(rank_of(card), lv) == order_of(rank_of(exp), lv), \
-                    "tribute card not max: %s vs %s" % (card, exp)
-                assert card in hands[p] and not is_wildcard(card, lv)
-                hands[p].remove(card)
-                tribute_cards[str(p)] = card
-                got[p] = card
-            # pair payers to receivers
             if n_trib == 1:
-                pairs = [(payers[0], first)]
-                lead_player = payers[0]
+                recv_of = {last: first}
+                lead_player = (last + 2) % 4
+            elif rank_of(got[payers[0]]) == rank_of(got[payers[1]]):
+                recv_of = {(first + 1) % 4: first,
+                           (first + 3) % 4: partner(first)}
+                lead_player = (first + 1) % 4
             else:
-                o0 = order_of(rank_of(got[payers[0]]), lv)
-                o1 = order_of(rank_of(got[payers[1]]), lv)
-                if o1 > o0:
-                    pairs = [(payers[1], first), (payers[0], partner(first))]
-                    lead_player = payers[1]
-                else:
-                    pairs = [(payers[0], first), (payers[1], partner(first))]
-                    lead_player = payers[0]
-            for payer, recv in pairs:
+                big = max(payers, key=lambda p: order_of(rank_of(got[p]), lv))
+                small = payers[1] if big == payers[0] else payers[0]
+                recv_of = {big: first, small: partner(first)}
+                lead_player = big
+            payer_of = dict((v, k) for k, v in recv_of.items())
+            for payer, recv in recv_of.items():
                 hands[recv].append(got[payer])
+            for recv in receivers:
+                payer = payer_of[recv]
                 gg = dict(g)
                 gg["tribute_cards"] = {str(k): v for k, v in tribute_cards.items()}
                 gg["return_cards"] = {str(k): v for k, v in return_cards.items()}
                 gg["resist"] = False
                 r = bots[recv].turn({"stage": "return", "global": gg})
                 card = r[0]
-                assert card in hands[recv], "return card not in hand"
-                assert rank_of(card) <= 9, "return must be face <= 10"
+                assert card in orig[recv], "return card not in original deal"
+                assert rank_of(card) != lv and rank_of(card) < 13 and \
+                    order_of(rank_of(card), lv) <= order_of(9, lv), \
+                    "return must be natural <= 10 and not the level card"
                 hands[recv].remove(card)
                 hands[payer].append(card)
                 return_cards[str(recv)] = card
@@ -266,7 +282,7 @@ def main():
     teamA_wins = 0
     for gi in range(args.games):
         rng = random.Random(args.seed + gi)
-        level = RANK_NAMES[rng.randrange(13)]
+        level = level_str_botzone(rng.randrange(13))   # ten -> '0' like the judge
         tm = None
         x = rng.random()
         if x > 1/3:

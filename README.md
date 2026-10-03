@@ -1,3 +1,7 @@
+> **OXbot fork（竞赛版）** — 基于 FableDan `7cc5e31`，修复了 4 类会被官方裁判扣分的 bug、与官方裁判对齐进贡规则、自博弈提速约 2.3 倍。
+> 修改清单见 [OXBOT_CHANGES.md](OXBOT_CHANGES.md)，Windows + RTX 5080 训练与上线步骤见 [docs/TRAINING_5080.md](docs/TRAINING_5080.md)。
+> 仅限非商业用途（见 LICENSE）。
+
 # FableDan — A Feature-Free GuanDan AI Trained by Self-Play RL
 
 FableDan is a from-scratch training framework for **GuanDan (掼蛋)**, a popular

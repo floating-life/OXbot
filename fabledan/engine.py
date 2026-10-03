@@ -27,13 +27,32 @@ def forced_tribute_card(cards, lv):
     return max(cand, key=lambda c: order_of(rank_of(c), lv))
 
 
-def default_return_card(cards, lv):
-    """Heuristic return (还贡): smallest-order card with face value <= 10."""
-    cand = [c for c in cards
-            if rank_of(c) <= 9 and not is_wildcard(c, lv)]  # A..10 face
-    if not cand:
-        cand = [c for c in cards if not is_wildcard(c, lv)] or list(cards)
-    return min(cand, key=lambda c: order_of(rank_of(c), lv))
+def return_ok_strict(card, lv):
+    """Return card accepted by every known judge version: natural 2..10 and
+    not the current level rank (rank index 1..9, != lv)."""
+    r = rank_of(card)
+    return 1 <= r <= 9 and r != lv
+
+
+def return_ok_judge(card, lv):
+    """What the attached (corrected) official judge accepts: pointorder index
+    not above '10' and not the level rank.  Used only as a fallback."""
+    r = rank_of(card)
+    return r != lv and r < 13 and order_of(r, lv) <= order_of(9, lv)
+
+
+def default_return_card(cards, lv, exclude=()):
+    """Heuristic return (还贡): smallest card that every judge accepts.
+
+    `exclude`: cards that must not be returned (e.g. the tribute card just
+    received -- the judge checks the return against the ORIGINAL deal)."""
+    pool = [c for c in cards if c not in exclude] or list(cards)
+    for ok in (return_ok_strict, return_ok_judge):
+        cand = [c for c in pool if ok(c, lv) and not is_wildcard(c, lv)]
+        if cand:
+            return min(cand, key=lambda c: (order_of(rank_of(c), lv), c))
+    cand = [c for c in pool if not is_wildcard(c, lv)] or pool
+    return min(cand, key=lambda c: (order_of(rank_of(c), lv), c))
 
 
 class GuandanRound:
@@ -59,6 +78,16 @@ class GuandanRound:
 
     # ------------------------------------------------------------------
     def _do_tribute(self):
+        """Tribute / return / resist exactly as the official Botzone judge
+        (verified against the judge source, see tests/test_judge_compat.py):
+
+        - single: last pays first, first returns to last; (last+2)%4 leads.
+        - double, different ranks: bigger card -> first, smaller -> first+2,
+          each receiver returns to its own payer; the bigger payer leads.
+        - double, SAME rank: clockwise -- first takes (first+1)'s card,
+          first+2 takes (first+3)'s card; (first+1) leads.
+        - resist (payers hold both big jokers): no exchange; first leads.
+        """
         mode = self.tribute_mode
         if not mode:
             self.lead_player = 0
@@ -80,33 +109,37 @@ class GuandanRound:
             self.hands[last].remove(c)
             self.hands[first].append(c)
             self.events.append(('tribute', last, rank_of(c)))
-            r = default_return_card(self.hands[first], lv)
+            r = default_return_card(self.hands[first], lv, exclude=(c,))
             self.hands[first].remove(r)
             self.hands[last].append(r)
             self.events.append(('return', first, rank_of(r)))
-            self.lead_player = last
+            self.lead_player = (last + 2) % 4
+            return
+        cards = {p: forced_tribute_card(self.hands[p], lv) for p in payers}
+        p_a, p_b = payers
+        if rank_of(cards[p_a]) == rank_of(cards[p_b]):
+            recv_of = {(first + 1) % 4: first, (first + 3) % 4: partner(first)}
+            self.lead_player = (first + 1) % 4
         else:
-            receivers = [first, partner(first)]
-            t0 = forced_tribute_card(self.hands[payers[0]], lv)
-            t1 = forced_tribute_card(self.hands[payers[1]], lv)
-            o0 = order_of(rank_of(t0), lv)
-            o1 = order_of(rank_of(t1), lv)
-            # bigger tribute -> first; tie -> last's card to first
-            if o1 > o0:
-                pay_pairs = [(payers[1], t1, first), (payers[0], t0, partner(first))]
-                self.lead_player = payers[1]
-            else:
-                pay_pairs = [(payers[0], t0, first), (payers[1], t1, partner(first))]
-                self.lead_player = payers[0]
-            for payer, card, recv in pay_pairs:
-                self.hands[payer].remove(card)
-                self.hands[recv].append(card)
-                self.events.append(('tribute', payer, rank_of(card)))
-            for payer, card, recv in pay_pairs:
-                r = default_return_card(self.hands[recv], lv)
-                self.hands[recv].remove(r)
-                self.hands[payer].append(r)
-                self.events.append(('return', recv, rank_of(r)))
+            big = max(payers, key=lambda p: order_of(rank_of(cards[p]), lv))
+            small = p_b if big == p_a else p_a
+            recv_of = {big: first, small: partner(first)}
+            self.lead_player = big
+        # the judge asks `last` first, then its partner
+        for payer in (last, partner(last)):
+            card = cards[payer]
+            self.hands[payer].remove(card)
+            self.hands[recv_of[payer]].append(card)
+            self.events.append(('tribute', payer, rank_of(card)))
+        payer_of = dict((v, k) for k, v in recv_of.items())
+        # returns: first, then first+2 (each to the player who paid them)
+        for recv in (first, partner(first)):
+            payer = payer_of[recv]
+            r = default_return_card(self.hands[recv], lv,
+                                    exclude=(cards[payer],))
+            self.hands[recv].remove(r)
+            self.hands[payer].append(r)
+            self.events.append(('return', recv, rank_of(r)))
 
     # ------------------------------------------------------------------
     def play(self, agents, sample_cb=None):

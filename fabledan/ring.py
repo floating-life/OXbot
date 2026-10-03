@@ -29,7 +29,7 @@ def _belief_label(rnd, me):
 
 
 class _Game:
-    __slots__ = ("gen", "obs", "samples", "round", "enc")
+    __slots__ = ("gen", "obs", "samples", "round", "enc", "tok_cache")
 
     def __init__(self, gen, rnd):
         self.gen = gen
@@ -37,13 +37,30 @@ class _Game:
         self.obs = None
         self.enc = None
         self.samples = []   # (toks, feat_chosen, player)
+        self.tok_cache = {}  # incremental tokenizer state (per round)
+
+
+LADDER_LEVEL = 1        # rank index of '2' (Botzone default initdata)
+
+
+def sample_setting(rng, ladder_frac=0.0):
+    """(level, tribute_mode) for a new training round.
+
+    With probability `ladder_frac` use the Botzone default setting (level 2,
+    no tribute, seat 0 leads) -- what ladder games use when the platform
+    passes empty initdata.  Otherwise random level and tribute mode."""
+    if ladder_frac > 0 and rng.random() < ladder_frac:
+        return LADDER_LEVEL, None
+    level = rng.randrange(13)
+    return level, random_tribute_mode(rng)
 
 
 class RingRunner:
-    def __init__(self, ring=16, seed=0, eps=0.02, top_k=10):
+    def __init__(self, ring=16, seed=0, eps=0.02, top_k=10, ladder_frac=0.0):
         self.rng = random.Random(seed)
         self.eps = eps
         self.top_k = top_k
+        self.ladder_frac = ladder_frac
         self.games = []
         self.finished = []  # list of episodes: (samples, rewards)
         self.episodes_done = 0
@@ -53,8 +70,8 @@ class RingRunner:
     # ------------------------------------------------------------------
     def _new_game(self):
         rng = random.Random(self.rng.getrandbits(48))
-        level = rng.randrange(13)
-        rnd = GuandanRound(level, rng, random_tribute_mode(rng))
+        level, tmode = sample_setting(rng, self.ladder_frac)
+        rnd = GuandanRound(level, rng, tmode)
         gen = rnd.play_steps()
         g = _Game(gen, rnd)
         self._advance(g, None, first=True)
@@ -73,10 +90,11 @@ class RingRunner:
                 self.episodes_done += 1
                 # restart in place
                 rng = random.Random(self.rng.getrandbits(48))
-                level = rng.randrange(13)
-                g.round = GuandanRound(level, rng, random_tribute_mode(rng))
+                level, tmode = sample_setting(rng, self.ladder_frac)
+                g.round = GuandanRound(level, rng, tmode)
                 g.gen = g.round.play_steps()
                 g.samples = []
+                g.tok_cache = {}
                 first, idx = True, None
                 continue
 
@@ -85,7 +103,7 @@ class RingRunner:
         """-> list of (slot, toks, feats[A,F]) for all pending decisions."""
         out = []
         for slot, g in enumerate(self.games):
-            g.enc = encode_decision(g.obs)
+            g.enc = encode_decision(g.obs, g.tok_cache)
             out.append((slot, g.enc[0], g.enc[1]))
         return out
 

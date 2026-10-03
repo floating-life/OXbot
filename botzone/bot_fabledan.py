@@ -67,37 +67,73 @@ def _classify_weights(z):
     return ("rule", None)
 
 
-def _load_model():
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join("data", "fabledan_weights.npz"),
-        os.path.join(here, "fabledan_weights.npz"),
-        os.path.join(here, "data", "fabledan_weights.npz"),
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                return _classify_weights(np.load(path, allow_pickle=False))
-            except Exception:
-                pass
-    # running from inside a zip (botzone zip upload with embedded weights)
+WEIGHTS_INFO = "none"
+
+
+def _zip_path(here):
+    zpath = here
+    while zpath and not os.path.isfile(zpath):
+        nxt = os.path.dirname(zpath)
+        if nxt == zpath:
+            return ""
+        zpath = nxt
+    return zpath
+
+
+def _read_packed(here, name):
+    """Bytes of `name` next to the script or inside the uploaded zip."""
+    p = os.path.join(here, name)
+    if os.path.isfile(p):
+        with open(p, "rb") as f:
+            return f.read()
     try:
-        import io
         import zipfile
-        zpath = here
-        while zpath and not os.path.isfile(zpath):
-            nxt = os.path.dirname(zpath)
-            if nxt == zpath:
-                zpath = ""
-                break
-            zpath = nxt
+        zpath = _zip_path(here)
         if zpath and zipfile.is_zipfile(zpath):
             with zipfile.ZipFile(zpath) as zf:
-                if "fabledan_weights.npz" in zf.namelist():
-                    buf = io.BytesIO(zf.read("fabledan_weights.npz"))
-                    return _classify_weights(np.load(buf, allow_pickle=False))
+                if name in zf.namelist():
+                    return zf.read(name)
     except Exception:
         pass
+    return None
+
+
+def _load_model():
+    """Weights lookup order:
+    1. data/<name> where <name> comes from weights_name.txt packed with the
+       code (versioned files in user storage: every uploaded bot version keeps
+       pointing at its own weights -> safe A/B and rollback);
+    2. data/fabledan_weights.npz (user storage, upstream default);
+    3. fabledan_weights.npz next to the script / embedded in the zip."""
+    global WEIGHTS_INFO
+    import io
+    here = os.path.dirname(os.path.abspath(__file__))
+    names = []
+    raw = _read_packed(here, "weights_name.txt")
+    if raw:
+        nm = raw.decode("utf-8", "ignore").strip()
+        if nm and "/" not in nm and "\\" not in nm:
+            names.append(nm)
+    names.append("fabledan_weights.npz")
+    for nm in names:
+        for path in (os.path.join("data", nm), os.path.join(here, "data", nm),
+                     os.path.join(here, nm)):
+            if os.path.exists(path):
+                try:
+                    m = _classify_weights(np.load(path, allow_pickle=False))
+                    WEIGHTS_INFO = path
+                    return m
+                except Exception:
+                    pass
+    try:
+        blob = _read_packed(here, "fabledan_weights.npz")
+        if blob:
+            m = _classify_weights(np.load(io.BytesIO(blob), allow_pickle=False))
+            WEIGHTS_INFO = "embedded"
+            return m
+    except Exception:
+        pass
+    WEIGHTS_INFO = "missing(%s)" % ",".join(names)
     return ("rule", None)
 
 
@@ -113,7 +149,10 @@ class Mirror:
         self.events = []
         self.left = [27, 27, 27, 27]
         self.done = []
-        self.applied_tributes = set()
+        self.applied_tributes = set()   # (kind, pid, card) already in events
+        self.applied_hand = set()       # (kind, pid, card) already in hand
+        self.received_tribute = set()   # tribute cards we received
+        self.resist = False             # 抗贡: tribute/return must answer []
         self.cur_lead = None     # Move to beat (None = lead freely)
 
     # -- helpers --
@@ -132,24 +171,30 @@ class Mirror:
                     if card is None or (isinstance(card, int) and card < 0):
                         continue
                     sig = (ev_name, pid, card)
-                    if sig in self.applied_tributes:
+                    if sig not in self.applied_tributes:
+                        self.applied_tributes.add(sig)
+                        self.events.append((ev_name, pid, rank_of(card)))
+                    if sig in self.applied_hand:
                         continue
-                    self.applied_tributes.add(sig)
-                    self.events.append((ev_name, pid, rank_of(card)))
+                    if pid == self.my_id:
+                        self.applied_hand.add(sig)
+                        if card in self.hand:
+                            self.hand.remove(card)
+                        continue
                     if ev_name == "tribute":
-                        if pid == self.my_id:
-                            if card in self.hand:
-                                self.hand.remove(card)
-                        elif self._tribute_receiver(g, pid) == self.my_id:
-                            if card not in self.hand:
-                                self.hand.append(card)
-                    else:  # return
-                        if pid == self.my_id:
-                            if card in self.hand:
-                                self.hand.remove(card)
-                        elif self._return_receiver(g, pid) == self.my_id:
-                            if card not in self.hand:
-                                self.hand.append(card)
+                        recv = self._tribute_receiver(g, pid)
+                    else:
+                        recv = self._return_receiver(g, pid)
+                    if recv < 0:
+                        # partial double tribute: receiver not decidable
+                        # yet -- apply on a later request
+                        continue
+                    self.applied_hand.add(sig)
+                    if recv == self.my_id:
+                        if card not in self.hand:
+                            self.hand.append(card)
+                        if ev_name == "tribute":
+                            self.received_tribute.add(card)
 
     @staticmethod
     def _first_card(v):
@@ -160,37 +205,45 @@ class Mirror:
             return v
         return -1
 
-    def _tribute_receiver(self, g, payer):
-        first = int(g.get("first", -1) if g.get("first") is not None else -1)
+    def _pair_tributes(self, g):
+        """payer -> receiver mapping, exactly as the official judge does it.
+
+        single: last -> first.
+        double, different ranks: bigger card -> first, smaller -> first+2.
+        double, SAME rank: clockwise -- (first+1) -> first, (first+3) -> first+2
+        (NOT "last's card to first" as the wiki says; verified on the judge
+        source -- getting this wrong makes us play a card we do not hold).
+        """
+        first = g.get("first")
+        first = int(first) if first is not None else -1
         tc = g.get("tribute_cards") or {}
         items = [(int(k), self._first_card(v)) for k, v in tc.items()]
         items = [(k, v) for k, v in items if v >= 0]
-        if len(items) <= 1:
-            return first
-        # double tribute: bigger card -> first, tie -> last's card to first
-        last = int(g.get("last", -1) if g.get("last") is not None else -1)
-        items.sort(key=lambda kv: (order_of(rank_of(kv[1]), self.lv),
-                                   1 if kv[0] == last else 0), reverse=True)
-        if items[0][0] == payer:
-            return first
-        return (first + 2) % 4
+        if first < 0 or not items:
+            return {}
+        try:
+            expected = int(g.get("tribute") or len(items))
+        except (TypeError, ValueError):
+            expected = len(items)
+        if len(items) < expected:
+            return {}          # double tribute not complete yet: undecided
+        if len(items) == 1:
+            return {items[0][0]: first}
+        (p0, c0), (p1, c1) = items[0], items[1]
+        if rank_of(c0) == rank_of(c1):
+            return {(first + 1) % 4: first, (first + 3) % 4: (first + 2) % 4}
+        if order_of(rank_of(c0), self.lv) > order_of(rank_of(c1), self.lv):
+            return {p0: first, p1: (first + 2) % 4}
+        return {p1: first, p0: (first + 2) % 4}
+
+    def _tribute_receiver(self, g, payer):
+        return self._pair_tributes(g).get(payer, -1)
 
     def _return_receiver(self, g, returner):
-        # returner gives back to the payer matched with them
-        first = int(g.get("first", -1) if g.get("first") is not None else -1)
-        tc = g.get("tribute_cards") or {}
-        items = [(int(k), self._first_card(v)) for k, v in tc.items()]
-        items = [(k, v) for k, v in items if v >= 0]
-        if len(items) == 1:
-            return items[0][0]
-        if len(items) == 2:
-            last = int(g.get("last", -1) if g.get("last") is not None else -1)
-            items.sort(key=lambda kv: (order_of(rank_of(kv[1]), self.lv),
-                                       1 if kv[0] == last else 0), reverse=True)
-            big_payer, small_payer = items[0][0], items[1][0]
-            if returner == first:
-                return big_payer
-            return small_payer
+        # returner gives back to the payer who paid them
+        for payer, recv in self._pair_tributes(g).items():
+            if recv == returner:
+                return payer
         return -1
 
     def _apply_history(self, hist):
@@ -206,15 +259,18 @@ class Mirror:
         if not hist:
             return
         if any(isinstance(h, dict) for h in hist):
-            # wiki dict format: apply entries after our own last entry
+            # wiki dict format: apply entries after our own last entry.
+            # The judge's first play request after a tribute/resist carries
+            # [{}, {}, {}, {}] -- empty dicts without "player": skip them
+            # (upstream crashed here with KeyError on every tribute game).
+            moves = [h for h in hist if isinstance(h, dict)
+                     and "player" in h and "response" in h]
             start = 0
-            for i, h in enumerate(hist):
-                if isinstance(h, dict) and \
-                        int(h.get("player", -1)) == self.my_id:
+            for i, h in enumerate(moves):
+                if int(h["player"]) == self.my_id:
                     start = i + 1
-            for h in hist[start:]:
-                if isinstance(h, dict):
-                    self._apply_move(int(h["player"]), h["response"])
+            for h in moves[start:]:
+                self._apply_move(int(h["player"]), h["response"])
             return
         # positional 4-slot format
         n = len(hist) or 4
@@ -252,9 +308,14 @@ class Mirror:
             self.events = []
             self.left = [27, 27, 27, 27]
             self.applied_tributes = set()
+            self.applied_hand = set()
+            self.received_tribute = set()
+            self.resist = False
             self.cur_lead = None
             self._lead_pid = -1
             self._pass_on = -1
+        if "resist" in g:
+            self.resist = bool(g.get("resist"))
         self._apply_global(g)
         if stage == "play":
             self.done = [int(x) for x in (req.get("done") or [])]
@@ -288,14 +349,14 @@ class Mirror:
         elif stage in ("tribute", "return") and isinstance(resp, list) and resp:
             # already handled via global tribute_cards next turn; remove now
             card = resp[0]
+            kind = "tribute" if stage == "tribute" else "return"
+            sig = (kind, self.my_id, card)
             if card in self.hand:
                 self.hand.remove(card)
-                self.applied_tributes.add(
-                    ("tribute" if stage == "tribute" else "return",
-                     self.my_id, card))
-                self.events.append((
-                    "tribute" if stage == "tribute" else "return",
-                    self.my_id, rank_of(card)))
+            self.applied_hand.add(sig)
+            if sig not in self.applied_tributes:
+                self.applied_tributes.add(sig)
+                self.events.append((kind, self.my_id, rank_of(card)))
 
     # -- decision --
     def lead_to_beat(self):
@@ -336,21 +397,26 @@ class Mirror:
 MODEL_KIND, MODEL = _load_model()
 
 
-MAX_LEGAL = 128   # cap legal moves to bound q_head memory
+MAX_LEGAL = 512   # q-head cost is ~linear and tiny; 128 used to drop moves
+                  # (incl. bombs) in ~0.5% of positions
 
 
-def choose_play(mirror):
+def choose_play(mirror, model_kind=None, model=None):
+    """Pick a play.  model_kind/model default to the globally loaded model
+    (tools/judge_runner.py passes its own to pit different models)."""
+    if model_kind is None:
+        model_kind, model = MODEL_KIND, MODEL
     lead = mirror.lead_to_beat()
     legal = gen_moves(mirror.hand, mirror.lv, lead)
 
-    # --- cap legal moves for memory safety ---
-    if len(legal) > MAX_LEGAL and MODEL_KIND == "transformer":
-        # Keep PASS + a diverse subset (prefer different types)
+    # --- cap legal moves for memory safety (practically never triggers) ---
+    if len(legal) > MAX_LEGAL and model_kind == "transformer":
+        # Keep PASS + every bomb-class move + a diverse subset of the rest
         from fabledan.combos import PASS as _PASS_TYPE
-        keep = [m for m in legal if m.type == _PASS_TYPE]
+        keep = [m for m in legal if m.type == _PASS_TYPE or m.is_bombish()]
         by_type = {}
         for m in legal:
-            if m.type != _PASS_TYPE:
+            if m.type != _PASS_TYPE and not m.is_bombish():
                 by_type.setdefault(m.type, []).append(m)
         slots = (MAX_LEGAL - len(keep)) // max(len(by_type), 1)
         for moves in by_type.values():
@@ -367,10 +433,10 @@ def choose_play(mirror):
 
     if len(legal) == 1:
         mv = legal[0]
-    elif MODEL_KIND == "transformer":
+    elif model_kind == "transformer":
         try:
             toks, feats = encode_decision(mirror.obs(legal, lead))
-            q = MODEL.q_values(toks, feats)
+            q = model.q_values(toks, feats)
             mv = legal[int(np.argmax(q))]
         except Exception:
             import traceback
@@ -379,29 +445,41 @@ def choose_play(mirror):
             mv = legal[RuleAgent().act(mirror.obs(legal, lead))]
         finally:
             gc.collect()
-    elif MODEL_KIND == "mlp":
+    elif model_kind == "mlp":
         o = mirror.obs(legal, lead)
         X = np.stack([encode_flat(o, m) for m in legal])
-        q, _ = MODEL.forward(X)
+        q, _ = model.forward(X)
         mv = legal[int(np.argmax(q))]
+    elif model_kind == "random":
+        mv = legal[model.randrange(len(legal))]
     else:
         from fabledan.agents import RuleAgent
         mv = legal[RuleAgent().act(mirror.obs(legal, lead))]
     if mv.type == PASS:
         return [[], []]
-    return [list(mv.cards), list(claim_ids(mv))]
+    return [[int(c) for c in mv.cards], [int(c) for c in claim_ids(mv)]]
 
 
-def respond(mirror, req):
-    stage = req.get("stage")
-    if stage == "deal":
+def exchange_response(mirror, stage):
+    """tribute / return answer that the official judge always accepts."""
+    if mirror.resist:
+        return []        # 抗贡: the judge still asks, and demands []
+    if not mirror.hand:
         return []
     if stage == "tribute":
         return [forced_tribute_card(mirror.hand, mirror.lv)]
-    if stage == "return":
-        return [default_return_card(mirror.hand, mirror.lv)]
+    return [default_return_card(mirror.hand, mirror.lv,
+                                exclude=mirror.received_tribute)]
+
+
+def respond(mirror, req, model_kind=None, model=None):
+    stage = req.get("stage")
+    if stage == "deal":
+        return []
+    if stage in ("tribute", "return"):
+        return [int(c) for c in exchange_response(mirror, stage)]
     if stage == "play":
-        return choose_play(mirror)
+        return choose_play(mirror, model_kind, model)
     return []
 
 
@@ -447,11 +525,15 @@ def main():
             elif stage == "deal":
                 action = []
             elif stage in ("tribute", "return"):
-                action = [mirror.hand[0]] if mirror.hand else []
+                try:
+                    action = exchange_response(mirror, stage)
+                except Exception:
+                    action = [] if getattr(mirror, "resist", False) else \
+                        ([mirror.hand[0]] if mirror.hand else [])
             else:
                 action = []
         out = {"response": action}
-        dbg = "FableDan model=%s" % MODEL_KIND
+        dbg = "OXbot/FableDan model=%s w=%s" % (MODEL_KIND, WEIGHTS_INFO)
         if DIAG:
             dbg += " | " + " || ".join(DIAG)
         out["debug"] = dbg[:1000]

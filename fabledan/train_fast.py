@@ -43,9 +43,11 @@ from .train import Replay
 # actor process
 # ---------------------------------------------------------------------------
 
-def actor_proc(actor_id, req_q, resp_q, sample_q, stop_ev, ring, eps, top_k, seed):
+def actor_proc(actor_id, req_q, resp_q, sample_q, stop_ev, ring, eps, top_k, seed,
+               ladder_frac=0.0):
     from .ring import RingRunner
-    runner = RingRunner(ring=ring, seed=seed, eps=eps, top_k=top_k)
+    runner = RingRunner(ring=ring, seed=seed, eps=eps, top_k=top_k,
+                        ladder_frac=ladder_frac)
     while not stop_ev.is_set():
         reqs = runner.collect_requests()
         # one message per actor: (actor_id, [(slot, toks, feats), ...])
@@ -151,35 +153,29 @@ def infer_server(cfg_dict, req_q, resp_qs, weight_q, stop_ev, device,
 # packaging (auto botzone zip)
 # ---------------------------------------------------------------------------
 
-BOT_MODULES = ["__init__.py", "cards.py", "combos.py", "engine.py",
-               "encode.py", "model_np.py", "agents.py", "train_demo.py",
-               "evaluate.py"]
-
-
 def pack_botzone_zip(weights_npz, out_zip):
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    bot_src = os.path.join(root, "botzone", "bot_fabledan.py")
-    os.makedirs(os.path.dirname(out_zip), exist_ok=True)
-    with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
-        z.write(bot_src, "__main__.py")
-        for m in BOT_MODULES:
-            z.write(os.path.join(root, "fabledan", m), "fabledan/" + m)
-        z.write(weights_npz, "fabledan_weights.npz")
-    return os.path.getsize(out_zip)
+    """Code zip (+ versioned weights copy next to it, see packaging.py).
+    Returns a human-readable summary line."""
+    from .packaging import pack
+    zp, wcopy, wname = pack(weights_npz, out_zip)
+    return "%s + %s" % (zp, wcopy)
 
 
 # ---------------------------------------------------------------------------
 # learner / main
 # ---------------------------------------------------------------------------
 
-def run_eval(model, device, games, opponent="rule", opp_model=None, seed=123):
+def run_eval(model, device, games, opponent="rule", opp_model=None, seed=123,
+             ladder_frac=0.0):
+    """Duplicate evaluation (same deal twice, seats swapped)."""
     from .agents import RuleAgent, TorchAgent
     from .evaluate import evaluate
     make_b = (lambda: RuleAgent()) if opponent == "rule" else \
         (lambda: TorchAgent(opp_model, device=device))
-    wr, _ = evaluate(lambda: TorchAgent(model, device=device), make_b,
-                     games=games, seed=seed)
-    return wr
+    wr, avg = evaluate(lambda: TorchAgent(model, device=device), make_b,
+                       games=games, seed=seed, duplicate=True,
+                       ladder_frac=ladder_frac)
+    return wr, avg
 
 
 def main():
@@ -213,6 +209,12 @@ def main():
                     if torch.cuda.is_available() else "cpu")
     ap.add_argument("--max-decisions", type=int, default=1024,
                     help="max decisions per inference batch")
+    ap.add_argument("--ladder-frac", type=float, default=0.0,
+                    help="fraction of self-play rounds in the Botzone default "
+                         "setting (level 2, no tribute); rest random")
+    ap.add_argument("--export-cycles", type=int, default=50,
+                    help="every N cycles export latest.npz and pack "
+                         "dist/fabledan_bot_latest.zip (0 = off)")
     ap.add_argument("--max-hours", type=float, default=0,
                     help="auto-stop after N hours: save ckpt, export npz, "
                          "pack upload zip (0 = run forever)")
@@ -252,7 +254,8 @@ def main():
     for a in range(args.actors):
         p = mp.Process(target=actor_proc,
                        args=(a, req_q, resp_qs[a], sample_q, stop_ev,
-                             args.ring, args.eps, args.top_k, 7000 + a),
+                             args.ring, args.eps, args.top_k, 7000 + a,
+                             args.ladder_frac),
                        daemon=True)
         p.start()
         actors.append(p)
@@ -336,48 +339,53 @@ def main():
             snapshot = FableDanNet(cfg).to(device)
             snapshot.load_state_dict(model.state_dict())
             snapshot.eval()
+        if args.export_cycles and (cycle + 1) % args.export_cycles == 0:
+            # numpy weights of the current model; pack/upload on demand:
+            #   python botzone/pack_bot.py --weights <out>/latest.npz
+            export_npz(model, os.path.join(args.out, "latest.npz"))
         if (cycle + 1) % args.eval_cycles == 0:
-            wr = run_eval(model, device, args.eval_games, "rule")
-            msg = "  eval vs rule: %.1f%%" % (wr * 100)
+            wr, avg = run_eval(model, device, args.eval_games, "rule",
+                               ladder_frac=args.ladder_frac)
+            msg = "  eval vs rule: %.1f%% (avg %+.2f)" % (wr * 100, avg)
             if snapshot is not None:
-                wr_s = run_eval(model, device, args.eval_games, "self",
-                                opp_model=snapshot)
-                msg += "  vs snapshot(-%d cyc): %.1f%%" % (
-                    args.snapshot_cycles, wr_s * 100)
+                wr_s, avg_s = run_eval(model, device, args.eval_games, "self",
+                                       opp_model=snapshot,
+                                       ladder_frac=args.ladder_frac)
+                msg += "  vs snapshot(-%d cyc): %.1f%% (avg %+.2f)" % (
+                    args.snapshot_cycles, wr_s * 100, avg_s)
             print(msg, flush=True)
             if wr >= best_wr:
                 best_wr = wr
                 save_ckpt(model, opt, meta, os.path.join(args.out, "best.pt"))
                 npz = os.path.join(args.out, "best.npz")
                 export_npz(model, npz)
-                zip_path = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "dist", "fabledan_bot_ready.zip")
-                size = pack_botzone_zip(npz, zip_path)
-                print("  [打包] %s (%.1f MB) — 可直接上传 botzone (python3)"
-                      % (zip_path, size / 1e6), flush=True)
             if wr >= 0.95 and not milestone_95:
                 milestone_95 = True
                 print("\n" + "=" * 64 +
                       "\n  里程碑: vs rule >= 95%%! 现在就值得上传第一版:\n"
-                      "  dist/fabledan_bot_ready.zip -> botzone GuanDan, "
-                      "编译器选 python3\n" + "=" * 64 + "\n", flush=True)
+                      "  python botzone/pack_bot.py --weights %s\n"
+                      "  zip -> Botzone 源码 (Python 3.6.5); fabledan_w_*.npz "
+                      "-> 用户存储空间(保持文件名)\n" % os.path.join(
+                          args.out, "latest.npz") + "=" * 64 + "\n",
+                      flush=True)
+                export_npz(model, os.path.join(args.out, "latest.npz"))
 
         if args.max_hours > 0 and time.time() - t_start >= args.max_hours * 3600:
             print("\n[到时收尾] 已运行 %.1f 小时，做最终评估与打包..."
                   % ((time.time() - t_start) / 3600), flush=True)
             save_ckpt(model, opt, meta, os.path.join(args.out, "latest.pt"))
-            wr = run_eval(model, device, max(args.eval_games, 100), "rule")
+            wr, _ = run_eval(model, device, max(args.eval_games, 100), "rule",
+                             ladder_frac=args.ladder_frac)
             save_ckpt(model, opt, meta, os.path.join(args.out, "final.pt"))
             npz = os.path.join(args.out, "final.npz")
             export_npz(model, npz)
             zip_path = os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 "dist", "fabledan_bot_ready.zip")
-            size = pack_botzone_zip(npz, zip_path)
-            print("[完成] vs rule %.1f%% | 上传文件: %s (%.1f MB)\n"
+            info = pack_botzone_zip(npz, zip_path)
+            print("[完成] vs rule %.1f%% | 上传文件: %s\n"
                   "下次续训: python -m fabledan.train_fast --out %s "
-                  "--resume %s" % (wr * 100, zip_path, size / 1e6, args.out,
+                  "--resume %s" % (wr * 100, info, args.out,
                                    os.path.join(args.out, "latest.pt")),
                   flush=True)
             break

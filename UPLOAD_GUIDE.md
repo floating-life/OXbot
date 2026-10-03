@@ -1,3 +1,5 @@
+> **OXbot 注**：默认模型权重约 16 MB，超过 4 MB 源码上限，请始终用 `python botzone/pack_bot.py --weights <npz>` 生成「代码 zip + `fabledan_w_<sha8>.npz`」，zip 作为源码上传（编译器 Python 3.6.5），npz 以原文件名上传到用户存储空间。完整步骤见 docs/TRAINING_5080.md。
+
 # Deploying FableDan to Botzone
 
 [Botzone](https://www.botzone.org.cn/) hosts a rated GuanDan ladder. This guide

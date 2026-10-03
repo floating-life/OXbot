@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# Frozen copy of upstream FableDan combos.py (reference for equivalence tests).
 """Move (一手牌) representation, enumeration with wildcards (配子), comparison.
 
 Move types and fixed sizes:
@@ -15,7 +16,7 @@ Move types and fixed sizes:
   ROCKET    4   (4 jokers)
 """
 
-from .cards import (BJ, SJ, NUM_RANKS, SEQV_TO_RANK, is_wildcard, order_of,
+from fabledan.cards import (BJ, SJ, NUM_RANKS, SEQV_TO_RANK, is_wildcard, order_of,
                     rank_of, seq_values, suit_of)
 
 PASS, SINGLE, PAIR, TRIPLE, FULL, STRAIGHT, PLATE, TUBE, BOMB, SFLUSH, ROCKET = range(11)
@@ -167,13 +168,6 @@ def claim_ids(move):
     return out
 
 
-# rank bitmask of each 5-card straight window, indexed by lowest seq value
-_WINDOW_MASK = [0] * 11
-for _low in range(1, 11):
-    for _v in range(_low, _low + 5):
-        _WINDOW_MASK[_low] |= 1 << SEQV_TO_RANK[_v]
-
-
 def gen_moves(cards, lv, lead=None):
     """All legal moves for `cards` under level `lv` against `lead`.
 
@@ -183,51 +177,37 @@ def gen_moves(cards, lv, lead=None):
     h = HandIndex(cards, lv)
     out = []
 
-    # Following: only the lead's own type (and bomb-class moves) can beat it,
-    # so skip enumerating the other types entirely.  The surviving moves keep
-    # their relative order, so the result is identical to filtering a full
-    # enumeration (verified in tests/test_fast_paths.py).
-    following = lead is not None and lead.type != PASS
-    if following:
-        need = None if lead.is_bombish() else lead.type
-        want = {need, BOMB, SFLUSH, ROCKET}
-    else:
-        want = None
-
     def add(mtype, key, picked, claim):
         out.append(Move(mtype, key, picked, claim))
 
     # --- singles ---
-    if want is None or SINGLE in want:
-        for r in range(NUM_RANKS):
-            if h.cnt[r] > 0:
-                add(SINGLE, order_of(r, lv), [h.by_rank[r][0]], [r])
-        if h.w > 0 and h.cnt[lv] == 0:
-            add(SINGLE, order_of(lv, lv), [h.wilds[0]], [lv])
+    for r in range(NUM_RANKS):
+        if h.cnt[r] > 0:
+            add(SINGLE, order_of(r, lv), [h.by_rank[r][0]], [r])
+    if h.w > 0 and h.cnt[lv] == 0:
+        add(SINGLE, order_of(lv, lv), [h.wilds[0]], [lv])
 
     # --- pairs ---
-    if want is None or PAIR in want:
-        for r in range(13):
-            if h.cnt[r] >= 2:
-                add(PAIR, order_of(r, lv), h.by_rank[r][:2], [r, r])
-            elif h.cnt[r] == 1 and h.w >= 1:
-                add(PAIR, order_of(r, lv), [h.by_rank[r][0], h.wilds[0]], [r, r])
-        if h.cnt[lv] == 0 and h.w >= 2:
-            add(PAIR, order_of(lv, lv), h.wilds[:2], [lv, lv])
-        for r in (SJ, BJ):
-            if h.cnt[r] >= 2:
-                add(PAIR, order_of(r, lv), h.by_rank[r][:2], [r, r])
+    for r in range(13):
+        if h.cnt[r] >= 2:
+            add(PAIR, order_of(r, lv), h.by_rank[r][:2], [r, r])
+        elif h.cnt[r] == 1 and h.w >= 1:
+            add(PAIR, order_of(r, lv), [h.by_rank[r][0], h.wilds[0]], [r, r])
+    if h.cnt[lv] == 0 and h.w >= 2:
+        add(PAIR, order_of(lv, lv), h.wilds[:2], [lv, lv])
+    for r in (SJ, BJ):
+        if h.cnt[r] >= 2:
+            add(PAIR, order_of(r, lv), h.by_rank[r][:2], [r, r])
 
     # --- triples ---
-    if want is None or TRIPLE in want:
-        for r in range(13):
-            if h.cnt[r] >= 1 and h.cnt[r] + h.w >= 3:
-                res = h.pick(r, 3, 0)
-                if res:
-                    add(TRIPLE, order_of(r, lv), res[0], res[1])
+    for r in range(13):
+        if h.cnt[r] >= 1 and h.cnt[r] + h.w >= 3:
+            res = h.pick(r, 3, 0)
+            if res:
+                add(TRIPLE, order_of(r, lv), res[0], res[1])
 
     # --- full house (三带二) ---
-    for r in (range(13) if (want is None or FULL in want) else ()):
+    for r in range(13):
         if h.cnt[r] == 0 or h.cnt[r] + h.w < 3:
             continue
         wt = max(0, 3 - h.cnt[r])
@@ -249,19 +229,11 @@ def gen_moves(cards, lv, lead=None):
             add(FULL, order_of(r, lv), trip[0] + pair_cards, trip[1] + [p, p])
 
     # --- straights (and straight flushes) ---
-    want_st = want is None or STRAIGHT in want
-    want_sf = want is None or SFLUSH in want
-    if want_sf:
-        # per-suit rank bitmasks: missing-card count of a 5-window becomes a
-        # popcount instead of a 5-element scan per suit and window
-        suit_mask = [0, 0, 0, 0]
-        for (s_, r_) in h.by_suit_rank:
-            suit_mask[s_] |= 1 << r_
-    for low in (range(1, 11) if (want_st or want_sf) else ()):
+    for low in range(1, 11):
         vals = list(range(low, low + 5))
         ranks = [SEQV_TO_RANK[v] for v in vals]
         need = sum(1 for r in ranks if h.cnt[r] == 0)
-        if want_st and need <= h.w:
+        if need <= h.w:
             picked, claim, wu = [], [], 0
             for r in ranks:
                 if h.cnt[r] > 0:
@@ -286,10 +258,9 @@ def gen_moves(cards, lv, lead=None):
             else:
                 add(STRAIGHT, low, picked, claim)
         # straight flush per suit
-        if want_sf:
-            win_mask = _WINDOW_MASK[low]
-        for s in (range(4) if want_sf else ()):
-            if bin(win_mask & ~suit_mask[s]).count("1") <= h.w:
+        for s in range(4):
+            miss = [r for r in ranks if (s, r) not in h.by_suit_rank]
+            if len(miss) <= h.w:
                 picked, claim, wu = [], [], 0
                 for r in ranks:
                     cell = h.by_suit_rank.get((s, r))
@@ -301,7 +272,7 @@ def gen_moves(cards, lv, lead=None):
                 add(SFLUSH, low, picked, claim)
 
     # --- plates (三连对) ---
-    for low in (range(1, 13) if (want is None or PLATE in want) else ()):
+    for low in range(1, 13):
         vals = list(range(low, low + 3))
         ranks = [SEQV_TO_RANK[v] for v in vals]
         need = sum(max(0, 2 - h.cnt[r]) for r in ranks)
@@ -316,7 +287,7 @@ def gen_moves(cards, lv, lead=None):
             add(PLATE, low, picked, claim)
 
     # --- tubes (钢板) ---
-    for low in (range(1, 14) if (want is None or TUBE in want) else ()):
+    for low in range(1, 14):
         vals = [low, low + 1]
         ranks = [SEQV_TO_RANK[v] for v in vals]
         need = sum(max(0, 3 - h.cnt[r]) for r in ranks)
@@ -331,7 +302,7 @@ def gen_moves(cards, lv, lead=None):
             add(TUBE, low, picked, claim)
 
     # --- bombs ---
-    for r in (range(13) if (want is None or BOMB in want) else ()):
+    for r in range(13):
         if h.cnt[r] == 0:
             continue
         max_n = min(h.cnt[r] + h.w, 10)
@@ -341,7 +312,7 @@ def gen_moves(cards, lv, lead=None):
                 add(BOMB, order_of(r, lv), res[0], res[1])
 
     # --- rocket ---
-    if (want is None or ROCKET in want) and h.cnt[SJ] >= 2 and h.cnt[BJ] >= 2:
+    if h.cnt[SJ] >= 2 and h.cnt[BJ] >= 2:
         add(ROCKET, 0, h.by_rank[SJ][:2] + h.by_rank[BJ][:2],
             [SJ, SJ, BJ, BJ])
 

@@ -28,9 +28,27 @@ def card_name(card: int) -> str:
     return SUIT_NAMES[suit_of(card)] + RANK_NAMES[r]
 
 
-def level_rank(level_str: str) -> int:
-    """Botzone level string ('2'..'10','J','Q','K','A') -> rank index 0..12."""
-    return RANK_NAMES.index(str(level_str))
+_LEVEL_ALIASES = {"0": 9, "10": 9, "T": 9}
+
+
+def level_rank(level_str) -> int:
+    """Botzone level string -> rank index 0..12.
+
+    The official Botzone judge writes ten as '0' (its cardscale uses '0'),
+    FableDan's own tools write '10'; accept both (and 'T').
+    """
+    s = str(level_str).strip().upper()
+    if s in _LEVEL_ALIASES:
+        return _LEVEL_ALIASES[s]
+    for i, name in enumerate(RANK_NAMES[:13]):
+        if name.upper() == s:
+            return i
+    raise ValueError("bad level string: %r" % (level_str,))
+
+
+def level_str_botzone(lv: int) -> str:
+    """Rank index 0..12 -> level string as the official judge writes it."""
+    return "0" if lv == 9 else RANK_NAMES[lv]
 
 
 def is_wildcard(card: int, lv: int) -> bool:
