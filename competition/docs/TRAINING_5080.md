@@ -130,7 +130,32 @@ BF16 flash/memory-efficient SDPA，改用 math SDPA + FP32；学习器仍保持�
 
 报告都在 `ckpts/dmc-realv2/eval/<时间戳>/`（`vs_*.json`、`judge.json`、`summary.json`）。
 晋级后，按 [C++ 迁移说明](../../docs/fabledan_cpp.md) 导出 FBDN，再运行 `check_submission.py`。
-旧 OXGDQ001 的 cf8 线上包走的是 C++ 引擎，暂时不能和本工具直接对打。要和线上版本比较，需要单独做跨引擎评测。
+### C++ 上线门槛：本机 5080 对战代替 BotZone 天梯
+
+主推 C++ 版本，强度验收全部在本机完成，不需要在 BotZone 打 500 局。
+冠军晋级后，流水线会自动运行 `scripts/cpp_release_5080_wsl.sh`；也可以单独运行：
+
+```bash
+bash scripts/cpp_release_5080_wsl.sh ckpts/dmc-realv2/champion/champion.npz
+```
+
+1. 构建 `bin/oxbot`（含 C++ 测试），把候选导出为 FBDN 权重，并做 Python/C++ 数值对齐检查。
+2. 用 `tools/cpp_duel.py` 在官方裁判下，让候选 C++ bot 对线上 cf8（`OXBOT_CF8_MODEL`）打
+   500 副同牌换座。双方都以长时运行进程参加，协议与 BotZone 相同。如果已有上一版 C++ 发布，也要对它打一遍。
+3. **发布条件**：对 cf8 和上一版的 95% 区间都完全大于 0，裁判 0 错误，模型全程出牌，并且本机 p99 每步用时低于 0.5 秒。
+   满足后生成 `dist/release/oxbot-fabledan-<sha8>-cpp-fp32.cpp` 和同名 `.fbd`，`dist/release/current.json` 记录当前版本。
+   手动上传 BotZone 只需要做一次，用来确认平台能编译、能加载模型。
+
+下一轮训练从冠军继续，新候选必须打赢现任冠军：
+
+```bash
+OXBOT_OUT=ckpts/dmc-r2 OXBOT_WARM_START=ckpts/dmc-realv2/champion/champion.pt \
+    OXBOT_CHAMPION_DIR=ckpts/dmc-realv2/champion bash scripts/selfplay_eval_5080_wsl.sh
+```
+
+C++ 推理已优化：权重转置后做向量化计算，每个注意力分数只算一次，候选动作批量计算，长时运行时缓存历史的 key/value。
+输出与原实现逐位一致。在模拟 G++ 7.2 -O2 的条件下，512 token、120 个候选的单步用时从 1.7 秒降到约 0.3 秒；
+实际对局中有缓存，中位数约 10 毫秒。
 
 ## 2. 看哪些数
 

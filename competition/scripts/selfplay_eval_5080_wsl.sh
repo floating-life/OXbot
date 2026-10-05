@@ -10,6 +10,12 @@
 #   OXBOT_MICRO_BATCH=256 ...                     # override the memory-safe default
 #   OXBOT_HOURS=0.1 OXBOT_DEALS=20 OXBOT_JUDGE_GAMES=8 \
 #       OXBOT_OUT=ckpts/dmc-smoke bash scripts/selfplay_eval_5080_wsl.sh   # smoke test
+#   # next round: continue from the champion, which the new candidate must beat
+#   OXBOT_OUT=ckpts/dmc-r2 OXBOT_WARM_START=ckpts/dmc-realv2/champion/champion.pt \
+#       OXBOT_CHAMPION_DIR=ckpts/dmc-realv2/champion bash scripts/selfplay_eval_5080_wsl.sh
+#
+# After a promotion the C++ release gate runs (scripts/cpp_release_5080_wsl.sh:
+# local official-judge match vs the online cf8 bot); OXBOT_CPP_RELEASE=0 skips it.
 #
 # Re-running "train" resumes from $OUT/latest.pt; Ctrl+C is safe.
 # Promotion rule (one rule, no hand tuning): the candidate becomes champion
@@ -47,7 +53,7 @@ JUDGE_GAMES="${OXBOT_JUDGE_GAMES:-200}"
 JUDGE="${OXBOT_JUDGE:-judge/judge_official.py}"
 SAFE_CUDA="${OXBOT_SAFE_CUDA:-1}"                # math SDPA + FP32 inference worker
 MICRO_BATCH="${OXBOT_MICRO_BATCH:-128}"           # learner gradient-accumulation chunk
-CHAMP_DIR="$OUT/champion"
+CHAMP_DIR="${OXBOT_CHAMPION_DIR:-$OUT/champion}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 RUN_ID="${OXBOT_RUN_ID:-$STAMP-$$}"
 export OXBOT_RUN_ID="$RUN_ID"
@@ -389,7 +395,13 @@ EOF
         cp "$EVAL_DIR/candidate.pt" "$CHAMP_DIR/champion.pt"
         printf '%s\n' "$EVAL_DIR" > "$CHAMP_DIR/promoted_from.txt"
         printf 'new champion: %s\n' "$CHAMP_DIR/champion.npz"
-        printf 'next: export FBDN with tools/export_fabledan_cpp.py and run check_submission.py\n'
+        if [[ "${OXBOT_CPP_RELEASE:-1}" == 1 ]]; then
+            log "C++ release gate (local official-judge match vs online cf8)"
+            local cpp_rc=0
+            run_step cpp_release bash scripts/cpp_release_5080_wsl.sh \
+                "$CHAMP_DIR/champion.npz" "$EVAL_DIR/cpp_release" || cpp_rc=$?
+            [[ $cpp_rc -eq 0 || $cpp_rc -eq 3 ]] || die "C++ release gate failed ($cpp_rc)"
+        fi
     fi
     printf 'reports: %s\n' "$EVAL_DIR"
 }

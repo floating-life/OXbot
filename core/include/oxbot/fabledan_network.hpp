@@ -61,6 +61,14 @@ private:
     };
 
     std::map<std::string, Tensor> tensors_;
+
+    // Per-block keys/values of the last encoded token sequence; see context().
+    struct EncoderCache {
+        std::vector<int> tokens;
+        std::vector<std::vector<float>> keys;
+        std::vector<std::vector<float>> values;
+    };
+    mutable EncoderCache cache_;
     bool ready_ = false;
     std::string status_ = "model_not_loaded";
     std::string payload_sha_;
@@ -87,9 +95,11 @@ private:
                               const std::string& name) const;
     std::vector<float> rms(const std::vector<float>& x, int rows, int dim,
                            const std::string& weight_name) const;
+    // Applies the MLP to `rows` stacked input rows at once.
     std::vector<float> mlp(const std::vector<float>& x,
                            const std::string& prefix,
-                           const std::vector<int>& linear_indices) const;
+                           const std::vector<int>& linear_indices,
+                           int rows) const;
 };
 
 }  // namespace oxbot

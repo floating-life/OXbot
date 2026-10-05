@@ -27,6 +27,10 @@ Examples
   # duplicate head-to-head through the judge: A (seats 0,2 then 1,3) vs B
   python tools/judge_runner.py --judge judge/judge_official.py --games 400 \
       --weights a.npz --weights-b b.npz --scenario ladder
+  # two different C++ bots (e.g. new FableDan vs online cf8), one shard of 4
+  python tools/judge_runner.py --games 1000 --require-model --shard 0/4 \
+      --driver "cpp:../bin/oxbot --model new.fbd" \
+      --driver-b "cpp:../bin/oxbot --model cf8.bin" --report shard0.json
 """
 
 import argparse
@@ -449,6 +453,12 @@ def main():
                     help="team B model (default = same as A); enables duplicate "
                          "head-to-head scoring")
     ap.add_argument("--driver", default="inproc")
+    ap.add_argument("--driver-b", default=None,
+                    help="team B driver (default = --driver); enables duplicate "
+                         "head-to-head between two different bot programs")
+    ap.add_argument("--shard", default="0/1",
+                    help="K/N: play only deal pairs with index %% N == K (same deal "
+                         "schedule in every shard, for parallel runs)")
     ap.add_argument("--bot-cwd", default=None, help="bot working directory (user data/ storage)")
     ap.add_argument("--bot-artifact", default=None,
                     help="local path of the exact executable used by a process driver; record its SHA-256")
@@ -462,8 +472,16 @@ def main():
 
     if args.games < 1 or args.timeout <= 0:
         ap.error("games and timeout must be positive")
-    if args.weights_b is not None and args.games % 2:
+    h2h = args.weights_b is not None or args.driver_b is not None
+    if h2h and args.games % 2:
         ap.error("duplicate head-to-head requires an even number of games")
+    try:
+        shard_k, shard_n = (int(x) for x in args.shard.split("/"))
+        if not 0 <= shard_k < shard_n:
+            raise ValueError
+    except ValueError:
+        ap.error("--shard must be K/N with 0 <= K < N")
+    driver_b = args.driver_b or args.driver
     if not os.path.isfile(args.judge):
         ap.error("judge not found: %s (no automatic fallback; specify --judge explicitly)" % args.judge)
     bot_artifact = None
@@ -478,30 +496,49 @@ def main():
     judge = JudgeHost(args.judge)
     rng = random.Random(args.seed)
     cpp_driver = args.driver.startswith("cpp:")
-    if cpp_driver and (args.weights is not None or args.weights_b is not None):
+    cpp_driver_b = driver_b.startswith("cpp:")
+    if (cpp_driver and args.weights is not None) or \
+            (cpp_driver_b and args.weights_b is not None):
         ap.error("cpp: loads its compiled/default or --model CMD weight path; --weights is for Python NPZ drivers")
     model_a = ("external_cpp", None) if cpp_driver else load_model(args.weights)
-    model_b = load_model(args.weights_b) if args.weights_b else model_a
-    h2h = args.weights_b is not None
+    if cpp_driver_b:
+        model_b = ("external_cpp", None)
+    elif args.weights_b:
+        model_b = load_model(args.weights_b)
+    elif args.driver_b is not None and cpp_driver:
+        model_b = load_model(None)
+    else:
+        model_b = model_a
+    times_by_team = {"a": [], "b": []}
+    game_records = []
+    played = 0
     n_err, by_scn, times, settings, failures = 0, {}, [], [], []
     cpp_play_turns, cpp_model_turns, cpp_model_shas = 0, 0, set()
     a_score = 0.0
     t_start = time.time()
     pair = None
+    g = -1
     for g in range(args.games):
         if not h2h or g % 2 == 0:
             pair = make_initdata(rng, args.scenario)
+        # Every shard draws the full schedule so deal i is identical everywhere.
+        pair_index = g // 2 if h2h else g
+        if pair_index % shard_n != shard_k:
+            continue
+        played += 1
         initdata, scn = pair
         a_seats = (0, 2) if g % 2 == 0 else (1, 3)
-        bots = [make_bot(args.driver, model_a if p in a_seats else model_b,
+        bots = [make_bot(args.driver if p in a_seats else driver_b,
+                         model_a if p in a_seats else model_b,
                          args.bot_cwd, args.timeout, args.require_model)
                 for p in range(4)]
         try:
             res = run_game(judge, bots, initdata, positional=args.positional)
         finally:
-            for b in bots:
+            for p, b in enumerate(bots):
                 times.extend(b.times)
-                if cpp_driver:
+                times_by_team["a" if p in a_seats else "b"].extend(b.times)
+                if isinstance(b, KeepProcBot) and b.model_protocol == "cpp":
                     cpp_play_turns += b.play_turns
                     cpp_model_turns += b.model_play_turns
                     if b.model_sha:
@@ -523,8 +560,12 @@ def main():
                 break
         elif h2h:
             sc = res["scores"]
-            a_score += sc[a_seats[0]] - sc[(a_seats[0] + 1) % 4]
+            diff = sc[a_seats[0]] - sc[(a_seats[0] + 1) % 4]
+            a_score += diff
+            game_records.append({"game": g, "pair": pair_index, "scenario": scn,
+                                 "a_seats": list(a_seats), "a_diff": diff})
     el = time.time() - t_start
+    g = played - 1     # report the games this shard actually played
     print("\n%d games through %s in %.1fs, errors: %d"
           % (g + 1, os.path.basename(args.judge), el, n_err))
     for scn, (n, e) in sorted(by_scn.items()):
@@ -546,10 +587,16 @@ def main():
                   "positional": args.positional, "elapsed_seconds": el,
                   "turn_seconds": {"p50": percentile(times, 50), "p99": percentile(times, 99),
                                    "max": max(times) if times else 0},
-                  "avg_score_diff": a_score / (g + 1) if h2h else None}
+                  "avg_score_diff": a_score / (g + 1) if h2h else None,
+                  "driver_b": driver_b, "shard": args.shard, "seed": args.seed,
+                  "scenario": args.scenario, "game_records": game_records,
+                  "turn_seconds_by_team": {
+                      team: {"n": len(ts), "p50": percentile(ts, 50),
+                             "p99": percentile(ts, 99), "max": max(ts) if ts else 0}
+                      for team, ts in times_by_team.items()}}
         if bot_artifact is not None:
             report["bot_artifact"] = bot_artifact
-        if cpp_driver:
+        if cpp_driver or cpp_driver_b:
             report["cpp_model"] = {"play_turns": cpp_play_turns,
                                    "model_selected_turns": cpp_model_turns,
                                    "model_sha_prefixes": sorted(cpp_model_shas)}

@@ -12,6 +12,11 @@
 #include <stdexcept>
 #include <utility>
 
+#if defined(__SSE__) || defined(_M_X64)
+#include <xmmintrin.h>
+#define OXBOT_FABLEDAN_SSE 1
+#endif
+
 // The amalgamated source also contains CandidateNetwork's private helper
 // named `require`; keep this backend's calls distinct even though the detail
 // namespace is imported for the member-function implementation below.
@@ -235,6 +240,7 @@ const FableDanNetwork::Tensor& FableDanNetwork::get(
 bool FableDanNetwork::load(const std::string& path) {
     ready_ = false;
     tensors_.clear();
+    cache_ = EncoderCache{};
     status_ = "model_not_loaded";
     payload_sha_.clear();
     feat_dim_ = 80;
@@ -425,6 +431,29 @@ bool FableDanNetwork::load(const std::string& path) {
         get("q_head.6.weight", {1, 1024});
         get("q_head.6.bias", {1});
         require(tensors_.size() == kExpectedTensors, "tensor_table_size_mismatch");
+        // Store every linear weight as [in][out] so linear() streams each
+        // input's weights contiguously (vectorizable axpy, one pass over the
+        // matrix per row block).  `shape` keeps the exported [out, in]
+        // contract; only the memory layout of these tensors changes.
+        for (auto& entry : tensors_) {
+            const std::string& name = entry.first;
+            Tensor& tensor = entry.second;
+            const bool is_weight = name.size() > 7U &&
+                name.compare(name.size() - 7U, 7U, ".weight") == 0;
+            if (!is_weight || tensor.shape.size() != 2U || name == "token_emb.weight") continue;
+            const int out = tensor.shape[0];
+            const int in = tensor.shape[1];
+            std::vector<float> transposed(tensor.data.size());
+            for (int o = 0; o < out; ++o) {
+                for (int i = 0; i < in; ++i) {
+                    transposed[static_cast<std::size_t>(i) * static_cast<std::size_t>(out) +
+                               static_cast<std::size_t>(o)] =
+                        tensor.data[static_cast<std::size_t>(o) * static_cast<std::size_t>(in) +
+                                    static_cast<std::size_t>(i)];
+                }
+            }
+            tensor.data.swap(transposed);
+        }
         ready_ = true;
         status_ = "ready";
         return true;
@@ -437,25 +466,55 @@ bool FableDanNetwork::load(const std::string& path) {
     }
 }
 
+namespace {
+
+// y[c] += a * w[c] for c in [0, n).  Each output keeps its own sequential
+// sum, so results are bit-identical to the scalar dot-product formulation
+// (separate multiply and add, no FMA, no reassociation).
+inline void axpy(float a, const float* w, float* y, int n) {
+    int c = 0;
+#ifdef OXBOT_FABLEDAN_SSE
+    const __m128 scale = _mm_set1_ps(a);
+    for (; c + 4 <= n; c += 4) {
+        const __m128 product = _mm_mul_ps(scale, _mm_loadu_ps(w + c));
+        _mm_storeu_ps(y + c, _mm_add_ps(_mm_loadu_ps(y + c), product));
+    }
+#endif
+    for (; c < n; ++c) y[c] += a * w[c];
+}
+
+}  // namespace
+
 std::vector<float> FableDanNetwork::linear(const std::vector<float>& x, int rows,
                                            int in, int out,
                                            const std::string& name) const {
     require(rows >= 0 && static_cast<std::size_t>(rows) * static_cast<std::size_t>(in) == x.size(),
             "linear_shape_invalid");
+    // Weight data is stored transposed ([in][out]); see load().
     const auto& weight = get(name + ".weight", {out, in}).data;
     const auto bias_it = tensors_.find(name + ".bias");
     const bool has_bias = bias_it != tensors_.end();
     if (has_bias) require(bias_it->second.shape == std::vector<int>{out},
                           "tensor_shape_mismatch");
-    std::vector<float> y(static_cast<std::size_t>(rows) * static_cast<std::size_t>(out));
-    for (int row = 0; row < rows; ++row) {
-        for (int column = 0; column < out; ++column) {
-            float sum = has_bias ? bias_it->second.data[static_cast<std::size_t>(column)] : 0.0f;
-            for (int input = 0; input < in; ++input) {
-                sum += x[static_cast<std::size_t>(row * in + input)] *
-                       weight[static_cast<std::size_t>(column * in + input)];
+    std::vector<float> y(static_cast<std::size_t>(rows) * static_cast<std::size_t>(out), 0.0f);
+    if (has_bias) {
+        for (int row = 0; row < rows; ++row) {
+            std::copy(bias_it->second.data.begin(), bias_it->second.data.end(),
+                      y.begin() + static_cast<std::ptrdiff_t>(row) * out);
+        }
+    }
+    // Row blocks keep a handful of output rows hot while each weight row is
+    // read once per block instead of once per row.
+    const int block = 8;
+    for (int first = 0; first < rows; first += block) {
+        const int last = std::min(rows, first + block);
+        for (int input = 0; input < in; ++input) {
+            const float* w = weight.data() + static_cast<std::size_t>(input) * static_cast<std::size_t>(out);
+            for (int row = first; row < last; ++row) {
+                axpy(x[static_cast<std::size_t>(row) * static_cast<std::size_t>(in) +
+                       static_cast<std::size_t>(input)],
+                     w, y.data() + static_cast<std::size_t>(row) * static_cast<std::size_t>(out), out);
             }
-            y[static_cast<std::size_t>(row * out + column)] = sum;
         }
     }
     return y;
@@ -487,8 +546,8 @@ std::vector<float> FableDanNetwork::rms(const std::vector<float>& x, int rows,
 
 std::vector<float> FableDanNetwork::mlp(
     const std::vector<float>& x, const std::string& prefix,
-    const std::vector<int>& linear_indices) const {
-    require(!linear_indices.empty(), "mlp_contract_invalid");
+    const std::vector<int>& linear_indices, int rows) const {
+    require(!linear_indices.empty() && rows >= 0, "mlp_contract_invalid");
     std::vector<float> current = x;
     for (std::size_t layer = 0; layer < linear_indices.size(); ++layer) {
         const std::string name = prefix + std::to_string(linear_indices[layer]);
@@ -498,7 +557,7 @@ std::vector<float> FableDanNetwork::mlp(
         }
         const auto& weight = weight_it->second;
         require(weight.shape.size() == 2U, "mlp_shape_invalid");
-        current = linear(current, 1, weight.shape[1], weight.shape[0], name);
+        current = linear(current, rows, weight.shape[1], weight.shape[0], name);
         if (layer + 1U != linear_indices.size()) {
             for (float& value : current) value = std::max(0.0f, value);
         }
@@ -514,118 +573,140 @@ std::vector<float> FableDanNetwork::context(const std::vector<int>& tokens) cons
     const auto& embedding = get("token_emb.weight", {vocab_, d_model_}).data;
     const auto& rope_cos = get("rope_cos", {max_seq_, qk_dim_ / 2}).data;
     const auto& rope_sin = get("rope_sin", {max_seq_, qk_dim_ / 2}).data;
-    std::vector<float> x(static_cast<std::size_t>(length * d_model_));
-    for (int time = 0; time < length; ++time) {
-        const int token = tokens[static_cast<std::size_t>(time)];
-        require(token >= 0 && token < vocab_, "token_invalid");
-        for (int dim = 0; dim < d_model_; ++dim) {
-            x[static_cast<std::size_t>(time * d_model_ + dim)] =
-                embedding[static_cast<std::size_t>(token * d_model_ + dim)];
-        }
-    }
+    for (const int token : tokens) require(token >= 0 && token < vocab_, "token_invalid");
 
     const int q_width = n_heads_ * qk_dim_;
     const int v_width = n_heads_ * v_dim_;
+    // The encoder is causal, so keys/values of position t depend only on
+    // tokens[0..t].  A long-running bot sees the same history grow by a few
+    // tokens per decision; reuse the cached keys/values of the shared prefix
+    // and encode only the new positions.  Results are bit-identical to a full
+    // recomputation (same per-position arithmetic, same summation order).
+    std::size_t shared = 0;
+    while (shared < cache_.tokens.size() && shared < tokens.size() &&
+           cache_.tokens[shared] == tokens[shared]) {
+        ++shared;
+    }
+    // Always recompute at least the final position: its residual stream is
+    // the output and is not cached.
+    const int prefix = static_cast<int>(std::min(shared, tokens.size() - 1U));
+    if (cache_.keys.size() != static_cast<std::size_t>(n_blocks_)) {
+        cache_.keys.assign(static_cast<std::size_t>(n_blocks_), {});
+        cache_.values.assign(static_cast<std::size_t>(n_blocks_), {});
+    }
     for (int block = 0; block < n_blocks_; ++block) {
-        const std::string prefix = "blocks." + std::to_string(block) + ".";
-        const auto normalized = rms(x, length, d_model_, prefix + "attn_norm.weight");
-        auto query = linear(normalized, length, d_model_, q_width,
-                            prefix + "attn.q_proj");
-        auto key = linear(normalized, length, d_model_, q_width,
-                          prefix + "attn.k_proj");
-        const auto value = linear(normalized, length, d_model_, v_width,
-                                  prefix + "attn.v_proj");
-        const auto& query_weight = get(prefix + "attn.q_norm.weight", {qk_dim_}).data;
-        const auto& key_weight = get(prefix + "attn.k_norm.weight", {qk_dim_}).data;
-        for (int time = 0; time < length; ++time) {
-            for (int head = 0; head < n_heads_; ++head) {
-                float q_mean_square = 0.0f;
-                float k_mean_square = 0.0f;
-                for (int dim = 0; dim < qk_dim_; ++dim) {
-                    const std::size_t at = static_cast<std::size_t>(time * q_width + head * qk_dim_ + dim);
-                    q_mean_square += query[at] * query[at];
-                    k_mean_square += key[at] * key[at];
-                }
-                const float q_scale = 1.0f / std::sqrt(q_mean_square / static_cast<float>(qk_dim_) + rms_eps_);
-                const float k_scale = 1.0f / std::sqrt(k_mean_square / static_cast<float>(qk_dim_) + rms_eps_);
-                for (int dim = 0; dim < qk_dim_; ++dim) {
-                    const std::size_t at = static_cast<std::size_t>(time * q_width + head * qk_dim_ + dim);
-                    query[at] *= q_scale * query_weight[static_cast<std::size_t>(dim)];
-                    key[at] *= k_scale * key_weight[static_cast<std::size_t>(dim)];
-                }
-                for (int dim = 0; dim < qk_dim_ / 2; ++dim) {
-                    const std::size_t q_at = static_cast<std::size_t>(time * q_width + head * qk_dim_ + dim);
-                    const std::size_t q_other = q_at + static_cast<std::size_t>(qk_dim_ / 2);
-                    const float q_first = query[q_at];
-                    const float q_second = query[q_other];
-                    const float q_cos = rope_cos[static_cast<std::size_t>(time * (qk_dim_ / 2) + dim)];
-                    const float q_sin = rope_sin[static_cast<std::size_t>(time * (qk_dim_ / 2) + dim)];
-                    query[q_at] = q_first * q_cos - q_second * q_sin;
-                    query[q_other] = q_first * q_sin + q_second * q_cos;
-                    const float k_first = key[q_at];
-                    const float k_second = key[q_other];
-                    key[q_at] = k_first * q_cos - k_second * q_sin;
-                    key[q_other] = k_first * q_sin + k_second * q_cos;
-                }
+        cache_.keys[static_cast<std::size_t>(block)].resize(
+            static_cast<std::size_t>(prefix) * static_cast<std::size_t>(q_width));
+        cache_.values[static_cast<std::size_t>(block)].resize(
+            static_cast<std::size_t>(prefix) * static_cast<std::size_t>(v_width));
+    }
+    cache_.tokens.clear();   // invalid until this call completes
+
+    const int fresh = length - prefix;
+    std::vector<float> x(static_cast<std::size_t>(fresh) * static_cast<std::size_t>(d_model_));
+    for (int row = 0; row < fresh; ++row) {
+        const int token = tokens[static_cast<std::size_t>(prefix + row)];
+        std::copy(embedding.begin() + static_cast<std::ptrdiff_t>(token) * d_model_,
+                  embedding.begin() + static_cast<std::ptrdiff_t>(token + 1) * d_model_,
+                  x.begin() + static_cast<std::ptrdiff_t>(row) * d_model_);
+    }
+
+    // q_norm/k_norm then RoPE for one head-packed row at absolute position
+    // `time` (same arithmetic as the reference implementation).
+    auto normalize_rotate = [&](float* row_data, int time,
+                                const std::vector<float>& norm_weight) {
+        for (int head = 0; head < n_heads_; ++head) {
+            float* base = row_data + head * qk_dim_;
+            float mean_square = 0.0f;
+            for (int dim = 0; dim < qk_dim_; ++dim) mean_square += base[dim] * base[dim];
+            const float norm = 1.0f / std::sqrt(mean_square / static_cast<float>(qk_dim_) + rms_eps_);
+            for (int dim = 0; dim < qk_dim_; ++dim) {
+                base[dim] *= norm * norm_weight[static_cast<std::size_t>(dim)];
+            }
+            for (int dim = 0; dim < qk_dim_ / 2; ++dim) {
+                const float first_value = base[dim];
+                const float second_value = base[dim + qk_dim_ / 2];
+                const float cosine = rope_cos[static_cast<std::size_t>(time * (qk_dim_ / 2) + dim)];
+                const float sine = rope_sin[static_cast<std::size_t>(time * (qk_dim_ / 2) + dim)];
+                base[dim] = first_value * cosine - second_value * sine;
+                base[dim + qk_dim_ / 2] = first_value * sine + second_value * cosine;
             }
         }
+    };
 
-        std::vector<float> attention(static_cast<std::size_t>(length * v_width), 0.0f);
-        const float scale = 1.0f / std::sqrt(static_cast<float>(qk_dim_));
-        for (int time = 0; time < length; ++time) {
+    std::vector<float> scores(static_cast<std::size_t>(length));
+    const float scale = 1.0f / std::sqrt(static_cast<float>(qk_dim_));
+    for (int block = 0; block < n_blocks_; ++block) {
+        const std::string prefix_name = "blocks." + std::to_string(block) + ".";
+        auto& keys = cache_.keys[static_cast<std::size_t>(block)];
+        auto& values = cache_.values[static_cast<std::size_t>(block)];
+        const auto normalized = rms(x, fresh, d_model_, prefix_name + "attn_norm.weight");
+        auto key = linear(normalized, fresh, d_model_, q_width, prefix_name + "attn.k_proj");
+        const auto value = linear(normalized, fresh, d_model_, v_width, prefix_name + "attn.v_proj");
+        const auto& query_weight = get(prefix_name + "attn.q_norm.weight", {qk_dim_}).data;
+        const auto& key_weight = get(prefix_name + "attn.k_norm.weight", {qk_dim_}).data;
+        for (int row = 0; row < fresh; ++row) {
+            normalize_rotate(key.data() + static_cast<std::size_t>(row * q_width), prefix + row, key_weight);
+        }
+        keys.insert(keys.end(), key.begin(), key.end());
+        values.insert(values.end(), value.begin(), value.end());
+
+        // Only the final position feeds the Q head, so the last block needs
+        // queries, attention and the FFN for that row alone.
+        const int skip = block + 1 == n_blocks_ ? fresh - 1 : 0;
+        const int active = fresh - skip;
+        const std::vector<float> active_normalized(
+            normalized.begin() + static_cast<std::ptrdiff_t>(skip) * d_model_, normalized.end());
+        auto query = linear(active_normalized, active, d_model_, q_width, prefix_name + "attn.q_proj");
+        std::vector<float> attention(static_cast<std::size_t>(active * v_width), 0.0f);
+        for (int row = 0; row < active; ++row) {
+            const int time = prefix + skip + row;
+            float* q_row = query.data() + static_cast<std::size_t>(row * q_width);
+            normalize_rotate(q_row, time, query_weight);
             for (int head = 0; head < n_heads_; ++head) {
+                const float* q = q_row + head * qk_dim_;
                 float largest = -std::numeric_limits<float>::infinity();
                 for (int source = 0; source <= time; ++source) {
+                    const float* k = keys.data() + static_cast<std::size_t>(source * q_width + head * qk_dim_);
                     float dot = 0.0f;
-                    for (int dim = 0; dim < qk_dim_; ++dim) {
-                        dot += query[static_cast<std::size_t>(time * q_width + head * qk_dim_ + dim)] *
-                               key[static_cast<std::size_t>(source * q_width + head * qk_dim_ + dim)];
-                    }
+                    for (int dim = 0; dim < qk_dim_; ++dim) dot += q[dim] * k[dim];
+                    scores[static_cast<std::size_t>(source)] = dot * scale;
                     largest = std::max(largest, dot * scale);
                 }
                 float denominator = 0.0f;
                 for (int source = 0; source <= time; ++source) {
-                    float dot = 0.0f;
-                    for (int dim = 0; dim < qk_dim_; ++dim) {
-                        dot += query[static_cast<std::size_t>(time * q_width + head * qk_dim_ + dim)] *
-                               key[static_cast<std::size_t>(source * q_width + head * qk_dim_ + dim)];
-                    }
-                    denominator += std::exp(dot * scale - largest);
+                    float& score_value = scores[static_cast<std::size_t>(source)];
+                    score_value = std::exp(score_value - largest);
+                    denominator += score_value;
                 }
+                float* out_row = attention.data() + static_cast<std::size_t>(row * v_width + head * v_dim_);
                 for (int source = 0; source <= time; ++source) {
-                    float dot = 0.0f;
-                    for (int dim = 0; dim < qk_dim_; ++dim) {
-                        dot += query[static_cast<std::size_t>(time * q_width + head * qk_dim_ + dim)] *
-                               key[static_cast<std::size_t>(source * q_width + head * qk_dim_ + dim)];
-                    }
-                    const float probability = std::exp(dot * scale - largest) / denominator;
-                    for (int dim = 0; dim < v_dim_; ++dim) {
-                        attention[static_cast<std::size_t>(time * v_width + head * v_dim_ + dim)] +=
-                            probability * value[static_cast<std::size_t>(source * v_width + head * v_dim_ + dim)];
-                    }
+                    const float probability = scores[static_cast<std::size_t>(source)] / denominator;
+                    const float* v = values.data() + static_cast<std::size_t>(source * v_width + head * v_dim_);
+                    for (int dim = 0; dim < v_dim_; ++dim) out_row[dim] += probability * v[dim];
                 }
             }
         }
 
-        const auto projected = linear(attention, length, v_width, d_model_,
-                                      prefix + "attn.out_proj");
-        for (std::size_t i = 0; i < x.size(); ++i) x[i] += projected[i];
-        const auto ffn_input = rms(x, length, d_model_, prefix + "ffn_norm.weight");
-        const auto gate = linear(ffn_input, length, d_model_, ffn_hidden_,
-                                 prefix + "ffn.gate_proj");
-        const auto up = linear(ffn_input, length, d_model_, ffn_hidden_,
-                               prefix + "ffn.up_proj");
+        const auto projected = linear(attention, active, v_width, d_model_,
+                                      prefix_name + "attn.out_proj");
+        const std::size_t offset = static_cast<std::size_t>(skip) * static_cast<std::size_t>(d_model_);
+        for (std::size_t i = 0; i < projected.size(); ++i) x[offset + i] += projected[i];
+        const std::vector<float> active_x(x.begin() + static_cast<std::ptrdiff_t>(offset), x.end());
+        const auto ffn_input = rms(active_x, active, d_model_, prefix_name + "ffn_norm.weight");
+        const auto gate = linear(ffn_input, active, d_model_, ffn_hidden_, prefix_name + "ffn.gate_proj");
+        const auto up = linear(ffn_input, active, d_model_, ffn_hidden_, prefix_name + "ffn.up_proj");
         std::vector<float> gated(gate.size());
         for (std::size_t i = 0; i < gated.size(); ++i) {
             const float sigmoid = 1.0f / (1.0f + std::exp(-gate[i]));
             gated[i] = gate[i] * sigmoid * up[i];
         }
-        const auto down = linear(gated, length, ffn_hidden_, d_model_,
-                                 prefix + "ffn.down_proj");
-        for (std::size_t i = 0; i < x.size(); ++i) x[i] += down[i];
+        const auto down = linear(gated, active, ffn_hidden_, d_model_, prefix_name + "ffn.down_proj");
+        for (std::size_t i = 0; i < down.size(); ++i) x[offset + i] += down[i];
     }
-    x = rms(x, length, d_model_, "final_norm.weight");
-    return std::vector<float>(x.end() - d_model_, x.end());
+    cache_.tokens = tokens;
+    const std::vector<float> last_row(x.end() - d_model_, x.end());
+    return rms(last_row, 1, d_model_, "final_norm.weight");
 }
 
 std::vector<float> FableDanNetwork::score(
@@ -650,25 +731,24 @@ std::vector<float> FableDanNetwork::forward(const std::vector<int>& tokens,
                 features.size() == rows * static_cast<std::size_t>(feat_dim_),
             "feature_shape_invalid");
     const auto ctx = context(tokens);
-    std::vector<float> result;
-    result.reserve(rows);
+    for (const float value : features) require(std::isfinite(value), "nonfinite_feature");
     static const std::vector<int> hand_layers{0, 2, 4, 6};
     static const std::vector<int> q_layers{0, 2, 4, 6};
+    const int count = static_cast<int>(rows);
+    // All candidates go through each layer together; every row's arithmetic
+    // is unchanged, only the weight traffic is shared.
+    const auto hand = mlp(features, "hand_mlp.", hand_layers, count);
+    std::vector<float> joined;
+    joined.reserve(rows * static_cast<std::size_t>(d_model_ * 2));
     for (std::size_t row = 0; row < rows; ++row) {
-        const std::size_t start = row * static_cast<std::size_t>(feat_dim_);
-        const std::vector<float> feature(features.begin() + static_cast<std::ptrdiff_t>(start),
-                                         features.begin() + static_cast<std::ptrdiff_t>(start + feat_dim_));
-        for (const float value : feature) require(std::isfinite(value), "nonfinite_feature");
-        const auto hand = mlp(feature, "hand_mlp.", hand_layers);
-        std::vector<float> joined;
-        joined.reserve(static_cast<std::size_t>(d_model_ * 2));
         joined.insert(joined.end(), ctx.begin(), ctx.end());
-        joined.insert(joined.end(), hand.begin(), hand.end());
-        const auto q = mlp(joined, "q_head.", q_layers);
-        require(q.size() == 1U && std::isfinite(q[0]), "nonfinite_prediction");
-        result.push_back(q[0]);
+        const auto begin = hand.begin() + static_cast<std::ptrdiff_t>(row * static_cast<std::size_t>(d_model_));
+        joined.insert(joined.end(), begin, begin + d_model_);
     }
-    return result;
+    const auto q = mlp(joined, "q_head.", q_layers, count);
+    require(q.size() == rows, "nonfinite_prediction");
+    for (const float value : q) require(std::isfinite(value), "nonfinite_prediction");
+    return q;
 }
 
 }  // namespace oxbot
