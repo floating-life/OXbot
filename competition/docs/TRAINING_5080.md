@@ -56,7 +56,7 @@ scripts\train_5080.bat
 | `--ring 32` | 32 | 每个进程同时跑的牌局数；越大 GPU 批次越大，往返越少 |
 | `--ladder-frac 0.5` | 0.5 | 一半牌局按 Botzone 默认设定（打 2、不进贡、0 号先出），一半随机级牌与进贡 |
 | `--batch 4096` | 4096 | 每个优化器步骤的样本数 |
-| `--micro-batch 256` | 256 | 梯度累积分块；实测 5080 默认模型约 7.2 GiB 峰值显存，建议保持 |
+| `--micro-batch 128` | 128 | 梯度累积分块；单张 16 GiB 5080 与推理进程同卡时的保守显存余量，可用 `OXBOT_MICRO_BATCH` 覆盖 |
 | `--eval-games 100` | 100 | 每次评测局数（同牌换座，成对出现） |
 | `--export-cycles 50` | 50 | 每 50 个周期导出一次 `latest.npz`（上传用的 numpy 权重） |
 
@@ -69,6 +69,68 @@ scripts\train_5080.bat
 - 每次只改一个参数，跑 10 分钟比较 samples/s。
 
 （本包已把自博弈进程提速约 2.3 倍；30,772 个局面上的牌型枚举、特征和分词与基线逐位一致，有测试 `tests\test_fast_paths.py` 保证。推理端仍保留 512 个合法动作上限，用于控制 Botzone 内存。）
+
+### 一键：从 real-v2 长时自博弈 + duplicate 评测（推荐）
+
+`scripts/selfplay_eval_5080_wsl.sh` 把“训练 → 冻结候选 → 评测 → 晋级”串成一条命令：
+
+```bash
+bash scripts/selfplay_eval_5080_wsl.sh                 # 默认训练 24 小时，然后评测
+OXBOT_HOURS=48 bash scripts/selfplay_eval_5080_wsl.sh  # 训练 48 小时
+bash scripts/selfplay_eval_5080_wsl.sh eval            # 冻结 latest.pt 并评测对应权重
+# 冒烟测试（几分钟）：
+OXBOT_HOURS=0.1 OXBOT_DEALS=20 OXBOT_JUDGE_GAMES=8 OXBOT_OUT=ckpts/dmc-smoke \
+    bash scripts/selfplay_eval_5080_wsl.sh
+```
+
+Windows PowerShell：`.\competition\scripts\selfplay_eval_5080.ps1 -Hours 24`。默认独立后台运行 `all`（训练及完整验收），
+启动后入口命令会返回；前台调试需显式加 `-Foreground`。不要在聊天的临时终端里直接启动长时 WSL 训练。
+Windows 冒烟：`.\competition\scripts\selfplay_eval_5080.ps1 -Hours 0.1 -Deals 20 -JudgeGames 8 -Out ckpts/dmc-smoke`。
+
+1. **训练**：用 `ckpts/real-v2/best.pt` 做 `--warm-start`，跑 `train_fast` 的 DMC 自博弈，`--ladder-frac 0.5`。
+   输出到 `ckpts/dmc-realv2`。再次运行会从 `latest.pt` 续训，并扣除检查点累计训练时长，补足原来的总预算。
+2. **评测**：冻结 `latest.pt` 为 `candidate.pt`，从该检查点导出对应的 `candidate.npz`，并冻结基线及已有冠军；
+   然后用 `tools/duplicate_eval.py` 多进程跑 1,000 副同牌换座（2,000 局）。
+   对手依次是 real-v2 BC、规则机器人，以及已存在的冠军。统计单位是“副牌”，报告配对 bootstrap 95% 置信区间。
+   评测 seed 固定，保证不同候选面对同一套牌。
+3. **合法性**：用官方裁判跑 200 局随机混合场景，并加 `--require-model`；报告必须完整记录指定局数且零错误。
+4. **晋级只看一条规则**：至少 1,000 副同牌换座，对 real-v2 和对现任冠军的置信区间都完全大于 0，且裁判 0 错误，才写入
+   `ckpts/dmc-realv2/champion/`。首次没有冠军时以 real-v2 为基线，并在报告中明确记录。
+   冒烟或 32 局级别的结果只验证流程，不会晋级。
+
+训练失败会停止后续评测，避免误用陈旧权重；同一输出目录由进程锁保护。候选须包含实际 DMC 优化器更新，
+权重及报告身份必须一致。`tools/selfplay_verdict.py` 集中检查晋级门槛，缺失或不完整报告会使流程失败。
+
+### 后台运行、故障记录与通知
+
+Windows 入口通过本机 WMI 服务启动隐藏监督进程，使训练不依赖 Codex 终端的生命周期。监督进程只在本轮运行期间
+请求阻止系统自动睡眠，结束后释放；不会更改系统电源方案，也不会在 CUDA 故障后自动重试。
+
+```powershell
+.\competition\scripts\selfplay_eval_5080.ps1 -Mode status
+```
+
+每次启动都会保存 `launch-<run_id>.json` 和 `logs/<run_id>.*`，分别保留训练标准输出、错误输出和监督日志。
+`supervisor_status.json` 记录监督进程及子进程身份，每 15 秒刷新；`last_pipeline.json` 记录训练、各对手评测、
+官方裁判和最终验收阶段。训练器另写 `training_progress.json`，区分响应时间与样本/优化器实际推进时间。
+周期检查点的 `stop_reason=running` 不代表训练完成；必须核对成功退出、累计预算和完整正式报告。
+
+监督进程发现结束或失败后写 `notification-needed.json` 并尝试显示一次 Windows 桌面提示；是否显示仍取决于系统
+通知设置。在本聊天配置的定时检查还会识别监督进程消失、心跳过期和训练长时间无进展，只在异常或全部验收完成时通知。
+本地聊天定时检查需要电脑开机且 Codex 应用运行；应用关闭期间，独立监督进程和落盘记录仍保留。
+
+### CUDA 长跑稳定性
+
+在 RTX 5080/WSL2 的长时间自博弈中，Windows NVIDIA 驱动曾记录 `nvlddmkm` 的 `GPUID: 100` 错误，
+随后 CUDA 上下文失效；Python 报错位置可能只是异步错误被发现的位置。脚本默认开启保守推理模式：推理进程禁用
+BF16 flash/memory-efficient SDPA，改用 math SDPA + FP32；学习器仍保持原来的 AMP 和训练参数。输入在送入 GPU
+前会检查 token 范围、特征形状和有限值，训练失败时不会被二次保存异常掩盖。短时诊断可额外设置
+`CUDA_LAUNCH_BLOCKING=1`；只有在确认驱动稳定且需要对照时才设置 `OXBOT_SAFE_CUDA=0`，不建议长跑关闭。
+为避免 math SDPA 与 learner 争用 16 GiB 显存，安全模式会把推理请求按每次最多 8 条分块；普通路径不改变批量策略。
+
+报告都在 `ckpts/dmc-realv2/eval/<时间戳>/`（`vs_*.json`、`judge.json`、`summary.json`）。
+晋级后，按 [C++ 迁移说明](../../docs/fabledan_cpp.md) 导出 FBDN，再运行 `check_submission.py`。
+旧 OXGDQ001 的 cf8 线上包走的是 C++ 引擎，暂时不能和本工具直接对打。要和线上版本比较，需要单独做跨引擎评测。
 
 ## 2. 看哪些数
 

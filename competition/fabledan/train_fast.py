@@ -19,10 +19,13 @@ Resume:
 """
 
 import argparse
+import contextlib
+import json
 import os
 import queue as pyqueue
 import math
 import signal
+import sys
 import time
 
 import numpy as np
@@ -73,12 +76,85 @@ def actor_proc(actor_id, req_q, resp_q, sample_q, stop_ev, ring, eps, top_k, see
 # inference server process
 # ---------------------------------------------------------------------------
 
+@contextlib.contextmanager
+def _attention_context(safe_mode=False):
+    """Select a conservative attention implementation when requested.
+
+    Flash/memory-efficient SDPA is normally the fastest choice, but a CUDA
+    kernel failure is asynchronous and is then often reported by an unrelated
+    operation (for example, constructing ``counts``).  The math backend is
+    slower but is a useful recovery mode for long runs and for diagnosing
+    driver/kernel problems.  Keep this helper local so the normal model and
+    exported weights are unchanged.
+    """
+    if not safe_mode:
+        yield
+        return
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+    except (ImportError, AttributeError):  # torch < 2.0 compatibility
+        with torch.backends.cuda.sdp_kernel(enable_flash=False,
+                                            enable_mem_efficient=False,
+                                            enable_math=True):
+            yield
+    else:
+        with sdpa_kernel(SDPBackend.MATH):
+            yield
+
+
+def _validate_infer_batch(all_toks, all_feats, counts, cfg):
+    """Validate actor data while it is still on the CPU.
+
+    Actor processes are untrusted transport peers from the learner's point of
+    view.  Checking here turns a malformed request into a clear Python error
+    instead of an out-of-range embedding/indexing operation whose CUDA error
+    may surface several lines later.
+    """
+    if not all_toks or len(all_toks) != len(all_feats) \
+            or len(all_toks) != len(counts):
+        raise RuntimeError("inference batch has no requests or mismatched lists")
+    if any(isinstance(c, (bool, np.bool_)) or not isinstance(c, (int, np.integer))
+           or int(c) <= 0 for c in counts):
+        raise RuntimeError("inference batch contains an invalid action count")
+    for i, (toks, feats, count) in enumerate(zip(all_toks, all_feats, counts)):
+        t = np.asarray(toks)
+        f = np.asarray(feats)
+        if t.ndim != 1 or t.size == 0 or t.size > cfg.max_seq:
+            raise RuntimeError("inference request %d has invalid token length %s"
+                               % (i, getattr(t, "shape", None)))
+        if not np.issubdtype(t.dtype, np.integer):
+            raise RuntimeError("inference request %d tokens are not integers" % i)
+        if int(t.min()) < 0 or int(t.max()) >= cfg.vocab:
+            raise RuntimeError("inference request %d contains an out-of-range token"
+                               % i)
+        if f.ndim != 2 or f.shape[0] != int(count) or f.shape[1] != cfg.feat_dim:
+            raise RuntimeError("inference request %d has feature shape %s, expected"
+                               " (%d, %d)" % (i, f.shape, int(count), cfg.feat_dim))
+        if not np.issubdtype(f.dtype, np.floating) or not np.isfinite(f).all():
+            raise RuntimeError("inference request %d contains non-finite features" % i)
+
+
+def _bounded_ranges(size, limit):
+    """Return contiguous request ranges whose width never exceeds ``limit``."""
+    if size < 0 or limit <= 0:
+        raise ValueError("size must be nonnegative and limit must be positive")
+    return [(start, min(start + limit, size))
+            for start in range(0, size, limit)]
+
+
 def infer_server(cfg_dict, req_q, resp_qs, weight_q, stop_ev, device,
-                 max_decisions, stats_every):
+                 max_decisions, stats_every, safe_cuda=False):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     torch.set_num_threads(2)
     torch.backends.cuda.matmul.allow_tf32 = True
-    use_amp = str(device).startswith("cuda")
+    # Keep learner AMP unchanged.  This switch is scoped to the separate
+    # inference worker, where the asynchronous CUDA error first surfaced.
+    use_amp = str(device).startswith("cuda") and not safe_cuda
+    # The conservative math SDPA backend materializes an attention matrix.
+    # Keep each forward small on 16-GiB cards; the normal flash path remains
+    # at the configured throughput.  This is deliberately below the shipped
+    # ring=32 so the learner retains room for its gradient/NTP activations.
+    request_limit = min(max_decisions, 8) if safe_cuda else max_decisions
     cfg = ModelConfig.from_dict(cfg_dict)
     model = FableDanNet(cfg).to(device).eval()
     sd = weight_q.get()
@@ -102,7 +178,7 @@ def infer_server(cfg_dict, req_q, resp_qs, weight_q, stop_ev, device,
             m = req_q.get(timeout=0.5)
             msgs.append(m)
             ndec += len(m[1])
-            while ndec < max_decisions:
+            while ndec < request_limit:
                 m = req_q.get_nowait()
                 msgs.append(m)
                 ndec += len(m[1])
@@ -118,25 +194,47 @@ def infer_server(cfg_dict, req_q, resp_qs, weight_q, stop_ev, device,
                 all_feats.append(feats)
                 counts.append(feats.shape[0])
                 route.append((actor_id, slot))
+        _validate_infer_batch(all_toks, all_feats, counts, cfg)
         B = len(all_toks)
-        maxlen = max(len(t) for t in all_toks)
-        T = np.zeros((B, maxlen), dtype=np.int64)
-        L = np.zeros(B, dtype=np.int64)
-        for j, t in enumerate(all_toks):
-            T[j, :len(t)] = t
-            L[j] = len(t)
-        Fcat = np.concatenate(all_feats, axis=0)
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16,
-                                             enabled=use_amp):
-            tT = torch.from_numpy(T).to(device, non_blocking=True)
-            tL = torch.from_numpy(L).to(device, non_blocking=True)
-            tF = torch.from_numpy(Fcat).to(device, non_blocking=True)
-            ctx, _ = model.encode_seq(tT, tL)
-            cnt = torch.tensor(counts, device=device)
-            ctx_rep = ctx.repeat_interleave(cnt, dim=0)
-            hemb = model.hand_mlp(tF)
-            q = model.q_head(torch.cat([ctx_rep, hemb], dim=-1))[:, 0]
-            q = q.float().cpu().numpy()
+
+        def infer_chunk(chunk_toks, chunk_feats, chunk_counts):
+            """Run one bounded forward; math SDPA scales quadratically in T."""
+            n = len(chunk_toks)
+            maxlen = max(len(t) for t in chunk_toks)
+            T = np.zeros((n, maxlen), dtype=np.int64)
+            L = np.zeros(n, dtype=np.int64)
+            for j, t in enumerate(chunk_toks):
+                T[j, :len(t)] = t
+                L[j] = len(t)
+            Fcat = np.concatenate(chunk_feats, axis=0)
+            with torch.no_grad(), _attention_context(safe_cuda), \
+                    torch.autocast("cuda", dtype=torch.bfloat16,
+                                   enabled=use_amp):
+                tT = torch.from_numpy(T).to(device, non_blocking=True)
+                tL = torch.from_numpy(L).to(device, non_blocking=True)
+                tF = torch.from_numpy(Fcat).to(device, non_blocking=True)
+                ctx, _ = model.encode_seq(tT, tL)
+                # ``chunk_counts`` is validated above; keep the index tensor
+                # explicitly integral and check finite outputs before routing.
+                cnt = torch.as_tensor(chunk_counts, dtype=torch.long,
+                                      device=device)
+                ctx_rep = ctx.repeat_interleave(cnt, dim=0)
+                hemb = model.hand_mlp(tF)
+                q = model.q_head(torch.cat([ctx_rep, hemb], dim=-1))[:, 0]
+                if not torch.isfinite(q).all().item():
+                    raise RuntimeError("non-finite inference Q values")
+                return q.float().cpu().numpy()
+
+        # ``request_limit`` bounds every actual forward, not just the number
+        # of actor messages gathered.  A single actor message can contain an
+        # entire ring and therefore exceed the limit.
+        q_parts = []
+        chunk_ranges = _bounded_ranges(B, request_limit)
+        for start, end in chunk_ranges:
+            q_parts.append(infer_chunk(all_toks[start:end],
+                                       all_feats[start:end],
+                                       counts[start:end]))
+        q = np.concatenate(q_parts, axis=0)
         # split and route
         per_actor = {}
         off = 0
@@ -147,7 +245,7 @@ def infer_server(cfg_dict, req_q, resp_qs, weight_q, stop_ev, device,
             resp_qs[actor_id].put(results)
         n_req += len(msgs)
         n_dec += B
-        n_fwd += 1
+        n_fwd += len(chunk_ranges)
         if time.time() - t_last > stats_every:
             print("[infer] %.0f decisions/s, avg batch %.0f decisions "
                   "(%.1f actor msgs)" % (n_dec / (time.time() - t_last),
@@ -174,15 +272,16 @@ def pack_botzone_zip(weights_npz, out_zip):
 # ---------------------------------------------------------------------------
 
 def run_eval(model, device, games, opponent="rule", opp_model=None, seed=123,
-             ladder_frac=0.0, check_stop=None):
+             ladder_frac=0.0, check_stop=None, safe_mode=False):
     """Duplicate evaluation (same deal twice, seats swapped)."""
     from .agents import RuleAgent, TorchAgent
     from .evaluate import evaluate
     make_b = (lambda: RuleAgent()) if opponent == "rule" else \
         (lambda: TorchAgent(opp_model, device=device))
-    wr, avg = evaluate(lambda: TorchAgent(model, device=device), make_b,
-                       games=games, seed=seed, duplicate=True,
-                       ladder_frac=ladder_frac, check_stop=check_stop)
+    with _attention_context(safe_mode):
+        wr, avg = evaluate(lambda: TorchAgent(model, device=device), make_b,
+                           games=games, seed=seed, duplicate=True,
+                           ladder_frac=ladder_frac, check_stop=check_stop)
     return wr, avg
 
 
@@ -251,6 +350,55 @@ def atomic_export(model, path):
 
 class TrainingDeadline(Exception):
     pass
+
+
+class TrainingProgress:
+    """Small, atomic health record independent of expensive checkpoints.
+
+    ``updated_at`` means the training loop is responsive. ``progress_at``
+    only changes when samples/updates/cycles advance or the phase changes,
+    so a live process waiting forever on an empty queue is not called healthy.
+    """
+
+    def __init__(self, path, run_id, interval=30.0):
+        self.path = path
+        self.run_id = run_id
+        self.interval = interval
+        self.last_write = -math.inf
+        self.last_marker = None
+        self.progress_at = None
+        self.warned = False
+
+    def update(self, *, phase, cycle, total_samples, optimizer_steps,
+               elapsed_seconds, stop_reason="running", error=None, force=False):
+        now = time.time()
+        monotonic = time.monotonic()
+        marker = (phase, cycle, total_samples, optimizer_steps)
+        if marker != self.last_marker:
+            self.progress_at = now
+            self.last_marker = marker
+        if not force and monotonic - self.last_write < self.interval:
+            return
+        record = dict(schema=1, run_id=self.run_id, pid=os.getpid(),
+                      updated_at=now, progress_at=self.progress_at,
+                      phase=phase, cycle=cycle, total_samples=total_samples,
+                      optimizer_steps=optimizer_steps,
+                      elapsed_seconds=elapsed_seconds, stop_reason=stop_reason,
+                      error=error)
+        temporary = self.path + ".tmp"
+        try:
+            with open(temporary, "w", encoding="utf-8") as stream:
+                json.dump(record, stream)
+                stream.flush()
+            os.replace(temporary, self.path)
+            self.last_write = monotonic
+            self.warned = False
+        except OSError as exc:
+            # A secondary status-write failure must not hide a CUDA error.
+            if not self.warned:
+                print("warning: could not write training progress: %s" % exc,
+                      file=sys.stderr, flush=True)
+                self.warned = True
 
 
 def check_workers(workers):
@@ -323,12 +471,18 @@ def main():
     ap.add_argument("--max-hours", type=float, default=0,
                     help="stop after N hours and save checkpoint + npz "
                          "(0 = no time limit)")
+    ap.add_argument("--safe-cuda", "--safe-mode", dest="safe_cuda", action="store_true",
+                    help="in the inference worker, disable BF16 AMP and use math "
+                         "SDPA; learner AMP remains unchanged")
     args = ap.parse_args()
     args.trainer = "train_fast"
     validate_args(ap, args)
     torch.set_num_threads(2)
     device = args.device
     torch.backends.cuda.matmul.allow_tf32 = True
+    # The learner retains its normal AMP path.  ``--safe-cuda`` is an
+    # inference-worker recovery switch; this avoids changing the training
+    # objective while avoiding optimized inference kernels as a workaround.
     use_amp = str(device).startswith("cuda")
     torch.manual_seed(args.seed)
     try:
@@ -397,7 +551,11 @@ def main():
     completed_cycle = start_cycle
     optimizer_steps = previous_meta.get("optimizer_steps", 0)
     partial_steps = 0
-    stop_reason = "cycles completed"
+    # Periodic checkpoints describe live training, not a successful exit.
+    stop_reason = "running"
+    phase = "starting"
+    progress = TrainingProgress(os.path.join(args.out, "training_progress.json"),
+                                os.environ.get("OXBOT_RUN_ID", "standalone-%d" % os.getpid()))
     workers = []
     queues = [req_q, sample_q, weight_q] + resp_qs
 
@@ -419,22 +577,44 @@ def main():
                 "torch_rng": torch.get_rng_state(),
                 "training_args": vars(args).copy(), "stop_reason": stop_reason}
         if torch.cuda.is_available():
-            data["cuda_rng"] = torch.cuda.get_rng_state_all()
+            # CUDA can be left in an error state after an asynchronous kernel
+            # failure.  Checkpoint metadata must never replace the original
+            # training exception with a second RNG-query exception.
+            try:
+                data["cuda_rng"] = torch.cuda.get_rng_state_all()
+            except Exception as exc:
+                print("warning: could not capture CUDA RNG state: %s" % exc,
+                      file=sys.stderr, flush=True)
+                data["cuda_rng_error"] = repr(exc)
         if snapshot is not None:
-            data["snapshot_model"] = {k: v.detach().cpu().clone()
-                                      for k, v in snapshot.state_dict().items()}
+            try:
+                data["snapshot_model"] = {k: v.detach().cpu().clone()
+                                          for k, v in snapshot.state_dict().items()}
+            except Exception as exc:
+                print("warning: could not capture snapshot state: %s" % exc,
+                      file=sys.stderr, flush=True)
+                data["snapshot_state_error"] = repr(exc)
             data["snapshot_cycle"] = snapshot_cycle
         return data
 
+    def publish_progress(force=False, error=None):
+        progress.update(phase=phase, cycle=completed_cycle,
+                        total_samples=total_samples, optimizer_steps=optimizer_steps,
+                        elapsed_seconds=previous_meta.get("elapsed_seconds", 0)
+                                        + time.monotonic() - t_start,
+                        stop_reason=stop_reason, error=error, force=force)
+
     def check_deadline():
+        publish_progress()
         if args.max_hours and time.monotonic() - t_start >= args.max_hours * 3600:
             raise TrainingDeadline()
 
     try:
+        publish_progress(force=True)
         server = mp.Process(target=infer_server, name="inference",
                             args=(cfg.to_dict(), req_q, resp_qs, weight_q,
                                   stop_ev, args.infer_device, args.max_decisions,
-                                  30.0), daemon=True)
+                                  30.0, args.safe_cuda), daemon=True)
         server.start()
         workers.append(server)
         push_weights()
@@ -448,6 +628,8 @@ def main():
             workers.append(p)
 
         for cycle in range(start_cycle, args.cycles):
+            phase = "collect"
+            publish_progress(force=True)
             got = 0
             partial_steps = 0
             t0 = time.monotonic()
@@ -464,6 +646,8 @@ def main():
                 total_samples += len(ep)
             t_collect = time.monotonic() - t0
             t0 = time.monotonic()
+            phase = "learn"
+            publish_progress(force=True)
             model.train()
             losses = []
             mb = min(args.micro_batch, args.batch)
@@ -476,25 +660,50 @@ def main():
                 step_loss = 0.0
                 for c in range(n_chunks):
                     s, e = c * mb, min((c + 1) * mb, args.batch)
-                    T = torch.from_numpy(T0[s:e]).to(device)
-                    L = torch.from_numpy(L0[s:e]).to(device)
-                    F = torch.from_numpy(F0[s:e]).to(device).unsqueeze(1)
-                    Z = torch.from_numpy(Z0[s:e]).to(device)
-                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                        q, hid = model(T, L, F)
-                        loss_q = torch.nn.functional.mse_loss(q[:, 0].float(), Z)
-                        loss = loss_q
-                        if cfg.ntp_weight > 0:
-                            loss = loss + cfg.ntp_weight * model.ntp_loss(T, hid)
-                        if args.belief_weight > 0 and BEL0 is not None:
-                            idx_last = (L - 1).clamp(min=0)
-                            ctx = hid[torch.arange(hid.shape[0], device=device), idx_last]
-                            bel_t = torch.from_numpy(BEL0[s:e]).to(device)
-                            loss = loss + args.belief_weight * model.belief_loss(ctx.float(), bel_t)
-                    if not torch.isfinite(loss).item():
-                        raise RuntimeError("non-finite DMC loss; refusing optimizer update")
-                    ((e - s) / args.batch * loss).backward()
-                    step_loss += loss_q.item() * (e - s) / args.batch
+                    # Keep every activation local to this chunk and release it
+                    # even when CUDA raises.  Otherwise the final micro-batch's
+                    # autograd graph stays referenced through the next collect
+                    # phase, competing with the inference worker on one GPU.
+                    T = L = F = Z = q = hid = loss_q = loss = None
+                    bel_t = ctx = idx_last = scaled_loss = None
+                    try:
+                        T = torch.from_numpy(T0[s:e]).to(device)
+                        L = torch.from_numpy(L0[s:e]).to(device)
+                        F = torch.from_numpy(F0[s:e]).to(device).unsqueeze(1)
+                        Z = torch.from_numpy(Z0[s:e]).to(device)
+                        with torch.autocast("cuda", dtype=torch.bfloat16,
+                                               enabled=use_amp):
+                            q, hid = model(T, L, F)
+                            loss_q = torch.nn.functional.mse_loss(q[:, 0].float(), Z)
+                            loss = loss_q
+                            if cfg.ntp_weight > 0:
+                                loss = loss + cfg.ntp_weight * model.ntp_loss(T, hid)
+                            if args.belief_weight > 0 and BEL0 is not None:
+                                idx_last = (L - 1).clamp(min=0)
+                                ctx = hid[torch.arange(hid.shape[0], device=device), idx_last]
+                                bel_t = torch.from_numpy(BEL0[s:e]).to(device)
+                                loss = loss + args.belief_weight * model.belief_loss(ctx.float(), bel_t)
+                        if not torch.isfinite(loss).item():
+                            raise RuntimeError("non-finite DMC loss; refusing optimizer update")
+                        scaled_loss = ((e - s) / args.batch * loss)
+                        scaled_loss.backward()
+                        step_loss += loss_q.item() * (e - s) / args.batch
+                    finally:
+                        # ``del`` (rather than empty_cache alone) removes the
+                        # live Python references that keep autograd graphs alive.
+                        if T is not None: del T
+                        if L is not None: del L
+                        if F is not None: del F
+                        if Z is not None: del Z
+                        if q is not None: del q
+                        if hid is not None: del hid
+                        if loss_q is not None: del loss_q
+                        if loss is not None: del loss
+                        if bel_t is not None: del bel_t
+                        if ctx is not None: del ctx
+                        if idx_last is not None: del idx_last
+                        if scaled_loss is not None: del scaled_loss
+                del T0, L0, F0, Z0, BEL0
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
                 opt.step()
                 optimizer_steps += 1
@@ -511,20 +720,28 @@ def main():
                                       float(np.mean(losses)), t_collect, t_train, sps), flush=True)
 
             if completed_cycle % args.eval_cycles == 0:
+                phase = "eval_rule"
+                publish_progress(force=True)
                 check_deadline()
                 wr, avg = run_eval(model, device, args.eval_games, "rule",
-                                   ladder_frac=args.ladder_frac, check_stop=check_deadline)
+                                   ladder_frac=args.ladder_frac, check_stop=check_deadline,
+                                   safe_mode=args.safe_cuda)
                 msg = "  eval vs rule: %.1f%% (avg reward %+.2f)" % (wr * 100, avg)
                 if snapshot is not None:
+                    phase = "eval_snapshot"
+                    publish_progress(force=True)
                     check_deadline()
                     wr_s, avg_s = run_eval(model, device, args.eval_games, "self",
                                            opp_model=snapshot, ladder_frac=args.ladder_frac,
-                                           check_stop=check_deadline)
+                                           check_stop=check_deadline,
+                                           safe_mode=args.safe_cuda)
                     msg += "  vs snapshot(-%d cyc): %.1f%% (avg reward %+.2f)" % (
                         completed_cycle - snapshot_cycle, wr_s * 100, avg_s)
                 print(msg, flush=True)
                 if wr >= best_wr:
                     best_wr = wr
+                    phase = "checkpoint"
+                    publish_progress(force=True)
                     atomic_checkpoint(model, opt, metadata(), os.path.join(args.out, "best.pt"))
                     atomic_export(model, os.path.join(args.out, "best.npz"))
                 if wr >= 0.95 and not milestone_95:
@@ -538,10 +755,13 @@ def main():
                 snapshot.load_state_dict(model.state_dict())
                 snapshot_cycle = completed_cycle
             if completed_cycle % args.ckpt_cycles == 0:
+                phase = "checkpoint"
+                publish_progress(force=True)
                 atomic_checkpoint(model, opt, metadata(), os.path.join(args.out, "latest.pt"))
             if args.export_cycles and completed_cycle % args.export_cycles == 0:
                 atomic_export(model, os.path.join(args.out, "latest.npz"))
             check_deadline()
+        stop_reason = "cycles completed"
     except KeyboardInterrupt:
         stop_reason = "interrupted"
         print("\nInterrupted; saving resumable checkpoint and NumPy weights.", flush=True)
@@ -552,15 +772,62 @@ def main():
         stop_reason = "training failed"
         raise
     finally:
+        # Preserve an active training/CUDA exception.  In particular, a CUDA
+        # context may be poisoned and make the final RNG read or export fail;
+        # neither secondary failure should hide the actionable root traceback.
+        active_exc = sys.exc_info()[1]
+        phase = "saving_final"
+        publish_progress(force=True, error=repr(active_exc) if active_exc else None)
+        shutdown_error = None
         try:
             shutdown_workers(stop_ev, workers, queues)
+        except Exception as exc:
+            shutdown_error = exc
+            print("warning: worker shutdown failed: %s" % exc,
+                  file=sys.stderr, flush=True)
         finally:
-            model.eval()
-            atomic_checkpoint(model, opt, metadata(), os.path.join(args.out, "latest.pt"))
-            atomic_export(model, os.path.join(args.out, "latest.npz"))
-            print("Saved cycle %d (%s): %s and %s" % (
-                completed_cycle, stop_reason, os.path.join(args.out, "latest.pt"),
-                os.path.join(args.out, "latest.npz")), flush=True)
+            try:
+                model.eval()
+            except Exception as exc:
+                shutdown_error = shutdown_error or exc
+                print("warning: model cleanup failed: %s" % exc,
+                      file=sys.stderr, flush=True)
+            final_error = None
+            try:
+                final_meta = metadata()
+            except Exception as exc:
+                final_meta = None
+                final_error = exc
+                print("warning: could not build final metadata: %s" % exc,
+                      file=sys.stderr, flush=True)
+            if final_meta is not None:
+                try:
+                    atomic_checkpoint(model, opt, final_meta,
+                                      os.path.join(args.out, "latest.pt"))
+                except Exception as exc:
+                    final_error = final_error or exc
+                    print("warning: final checkpoint save failed: %s" % exc,
+                          file=sys.stderr, flush=True)
+                try:
+                    atomic_export(model, os.path.join(args.out, "latest.npz"))
+                except Exception as exc:
+                    final_error = final_error or exc
+                    print("warning: final NumPy export failed: %s" % exc,
+                          file=sys.stderr, flush=True)
+            cleanup_error = active_exc or final_error or shutdown_error
+            phase = "failed" if cleanup_error else "stopped"
+            publish_progress(force=True,
+                             error=repr(cleanup_error) if cleanup_error else None)
+            if final_error is not None and active_exc is None:
+                raise final_error
+            if shutdown_error is not None and active_exc is None \
+                    and final_error is None:
+                raise shutdown_error
+            if final_meta is not None and final_error is None \
+                    and shutdown_error is None:
+                print("Saved cycle %d (%s): %s and %s" % (
+                    completed_cycle, stop_reason, os.path.join(args.out, "latest.pt"),
+                    os.path.join(args.out, "latest.npz")), flush=True)
 
 
 if __name__ == "__main__":
