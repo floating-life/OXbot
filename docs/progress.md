@@ -512,3 +512,6 @@ GCC 7.2 严格单文件编译、完整 GCC 13 构建、7 项进程协议检查�
 
 2026-10-05：主线改为 C++。C++ FableDan 推理优化后与原实现逐位一致：模拟 G++ 7.2 -O2，512 token、120 个候选从 1,693 ms 降到约 300 ms；实际对局用时中位数约 10 ms，p99 约 100 ms（原来分别约 370 ms 和 850 ms，有 BotZone 超时风险）。新增本机 C++ 对 C++ 同牌换座评测 `competition/tools/cpp_duel.py`（官方裁判，多进程分片），以及发布门槛 `competition/scripts/cpp_release_5080_wsl.sh`：对线上 cf8 打 500 副，区间完全大于 0 才打包。下一步：对现任冠军运行发布门槛。
 
+2026-10-07：冠军 C++ 对 cf8 完成 500 副同牌换座，每局 +2.267，95% CI [2.187, 2.346]，裁判错误 0，模型出牌 85057/85057（100%），bot A p99 0.997020 秒、max 1.422591 秒；报告 reports/cpp_release/20261007-000651/。
+NOT RELEASED；gate_failures：cf8: candidate p99 0.997s over local limit 0.500s。
+走 B：从冠军启动第二轮 24 小时训练，输出 competition/ckpts/dmc-r2，run_id=20261007-001410-aab39940；status=running、stage=training、phase=collect，stderr 0 字节，新候选晋级必须胜过现任冠军。
