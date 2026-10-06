@@ -11,6 +11,9 @@ param(
     [ValidateRange(1, 4096)]
     [int]$MicroBatch = 128,
     [string]$Out = 'ckpts/dmc-realv2',
+    [string]$WarmStart = '',
+    [string]$ChampionDir = '',
+    [string]$Cf8Model = '',
     [string]$Distribution = 'Ubuntu-24.04',
     [switch]$Foreground,
     [switch]$NoDesktopNotification,
@@ -154,6 +157,7 @@ $manifest = [ordered]@{
     safe_cuda = 1; evaluation_seed = 20261101
     distribution = $Distribution; competition_root = $competitionRoot; output_directory = $outputDirectory
     requested_out = $Out; host_executable = $hostExecutable; supervisor_script = $supervisorScript
+    warm_start = $WarmStart; champion_dir = $ChampionDir; cf8_model = $Cf8Model
     launch_path = $launchPath; supervisor_pid = $null; heartbeat_seconds = $HeartbeatSeconds
     launch_backend = if ($Foreground) { 'foreground' } else { 'windows_wmi' }
     stdout_path = Join-Path $logsDirectory "$runId.log"

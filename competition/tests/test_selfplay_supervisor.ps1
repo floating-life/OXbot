@@ -12,13 +12,16 @@ function Assert-True([bool]$Condition, [string]$Description) {
     $script:passed++
     Write-Output "PASS: $Description"
 }
-function Invoke-Entry([string]$Out, [string]$Scenario, [string]$Mode = 'all') {
+function Invoke-Entry([string]$Out, [string]$Scenario, [string]$Mode = 'all', [hashtable]$Settings = @{}) {
     $tag = [Guid]::NewGuid().ToString('N').Substring(0, 8)
     $stdout = Join-Path $testRoot "$tag.launcher.log"
     $stderr = Join-Path $testRoot "$tag.launcher.stderr.log"
     $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
         ('"' + $entry + '"'), '-Mode', $Mode, '-Out', ('"' + $Out + '"'), '-HeartbeatSeconds', '1',
         '-NoDesktopNotification', '-TestChildScript', ('"' + $fixture + '"'), '-TestScenario', $Scenario)
+    foreach ($setting in $Settings.GetEnumerator()) {
+        $arguments += @('-' + $setting.Key, ('"' + $setting.Value + '"'))
+    }
     $process = Start-Process -FilePath $ShellExecutable -ArgumentList $arguments -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     $null = $process.Handle
@@ -41,13 +44,35 @@ function Wait-Terminal([string]$Out) {
 }
 
 $successfulOut = Join-Path $testRoot 'successful all'
-$launch = Invoke-Entry $successfulOut 'success'
+$launch = Invoke-Entry $successfulOut 'success' 'all' @{
+    WarmStart = 'ckpts/test warm/champion.pt'
+    ChampionDir = 'ckpts/test champion'
+    Cf8Model = '../models/test cf8.bin'
+}
 Assert-True ($launch.code -eq 0) 'launcher acknowledged the detached supervisor'
 $running = Read-State $successfulOut
 Assert-True ($running.status -eq 'running') 'launcher exits while the pipeline is still running'
 $launchConfig = Get-Content -LiteralPath $running.launch_path -Raw -Encoding UTF8 | ConvertFrom-Json
 Assert-True ($launchConfig.safe_cuda -eq 1 -and $launchConfig.evaluation_seed -eq 20261101) 'manifest fixes the safe CUDA mode and evaluation seed for the continued experiment'
 Assert-True ($launchConfig.micro_batch -eq 128) 'manifest fixes the memory-safe learner micro-batch'
+$supervisorAst = [Management.Automation.Language.Parser]::ParseFile($launchConfig.supervisor_script, [ref]$null, [ref]$null)
+$wslAssignment = $supervisorAst.Find({ param($node)
+    $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+    $node.Left.Extent.Text -eq '$arguments' -and $node.Extent.Text.Contains('OXBOT_HOURS=')
+}, $true)
+$wslArguments = & {
+    $config = $launchConfig
+    $linuxCompetition = '/mnt/d/coding/OXbot/competition'
+    $linuxOutput = '/tmp/test run'
+    $hoursText = ([double]$config.hours).ToString([Globalization.CultureInfo]::InvariantCulture)
+    $microBatch = $config.micro_batch
+    $WarmStart = $config.warm_start; $ChampionDir = $config.champion_dir; $Cf8Model = $config.cf8_model
+    Invoke-Expression $wslAssignment.Extent.Text
+    $arguments
+}
+Assert-True ($wslArguments -contains 'OXBOT_WARM_START=ckpts/test warm/champion.pt' -and
+    $wslArguments -contains 'OXBOT_CHAMPION_DIR=ckpts/test champion' -and
+    $wslArguments -contains 'OXBOT_CF8_MODEL=../models/test cf8.bin') 'launcher settings appear in the WSL command line'
 $workerProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$($running.supervisor_pid)"
 $workerParent = Get-CimInstance Win32_Process -Filter "ProcessId=$($workerProcess.ParentProcessId)"
 Assert-True ($workerParent.Name -eq 'WmiPrvSE.exe') 'supervisor is parented by WMI, outside the caller process tree'

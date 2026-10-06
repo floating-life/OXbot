@@ -1,8 +1,16 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$LaunchPath)
+param(
+    [Parameter(Mandatory)][string]$LaunchPath,
+    [string]$WarmStart = '',
+    [string]$ChampionDir = '',
+    [string]$Cf8Model = ''
+)
 
 $ErrorActionPreference = 'Stop'
 $config = Get-Content -LiteralPath $LaunchPath -Raw -Encoding UTF8 | ConvertFrom-Json
+if (-not $WarmStart) { $WarmStart = [string]$config.warm_start }
+if (-not $ChampionDir) { $ChampionDir = [string]$config.champion_dir }
+if (-not $Cf8Model) { $Cf8Model = [string]$config.cf8_model }
 $lock = $null
 $child = $null
 $terminalRecorded = $false
@@ -183,6 +191,9 @@ namespace OXBot.Supervisor {
             "OXBOT_OUT=$linuxOutput", "OXBOT_RUN_ID=$($config.run_id)",
             "OXBOT_MICRO_BATCH=$microBatch",
             "OXBOT_SAFE_CUDA=$($config.safe_cuda)", "OXBOT_EVAL_SEED=$($config.evaluation_seed)",
+            $(if ($WarmStart) { "OXBOT_WARM_START=$WarmStart" }),
+            $(if ($ChampionDir) { "OXBOT_CHAMPION_DIR=$ChampionDir" }),
+            $(if ($Cf8Model) { "OXBOT_CF8_MODEL=$Cf8Model" }),
             'bash', 'scripts/selfplay_eval_5080_wsl.sh', $config.mode)
     } else {
         $executable = $config.host_executable
