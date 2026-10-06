@@ -289,6 +289,28 @@ class SelfplayScriptTests(unittest.TestCase):
         self.assertEqual((self.out / "last_training.json").read_bytes(), training)
         self.assertFalse((self.out / "champion").exists())
 
+    def test_custom_champion_is_frozen_and_required_for_promotion(self):
+        self.env["OXBOT_TEST_TRAIN"] = "success"
+        champion_dir = self.root / "current champion"
+        champion_dir.mkdir()
+        champion = champion_dir / "champion.npz"
+        champion.write_bytes(b"current champion weights")
+        self.env["OXBOT_CHAMPION_DIR"] = str(champion_dir)
+
+        result = self.run_script()
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        folder = Path(self.read_status()["eval_dir"])
+        status = json.loads((folder / "training_status.json").read_text())
+        self.assertTrue(status["champion_required"])
+        self.assertEqual((folder / "previous_champion.npz").read_bytes(), champion.read_bytes())
+        calls = self.python_calls()
+        champion_duel = next(c for c in calls if c[0].endswith("duplicate_eval.py")
+                             and c[c.index("--b") + 1] == str(folder / "previous_champion.npz"))
+        self.assertEqual(champion_duel[champion_duel.index("--deals") + 1], "1000")
+        verdict = next(c for c in calls if c[0].endswith("selfplay_verdict.py"))
+        self.assertIn("--require-champion", verdict)
+
     def test_eval_rejects_checkpoint_changed_after_verified_completion(self):
         self.env["OXBOT_TEST_TRAIN"] = "success"
         result = self.run_script("train")

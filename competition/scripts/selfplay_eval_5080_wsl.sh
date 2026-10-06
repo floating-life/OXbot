@@ -308,14 +308,14 @@ evaluate() {
     local previous_champion="$EVAL_DIR/previous_champion.npz"
     local verdict_args=()
     log "freeze candidate checkpoint and export its matching NumPy weights"
-    run_step eval_freeze "$PY" - "$OUT" "$EVAL_DIR" "$BASELINE" <<'EOF' || die "candidate freeze/validation"
+    run_step eval_freeze "$PY" - "$OUT" "$EVAL_DIR" "$BASELINE" "$CHAMP_DIR" <<'EOF' || die "candidate freeze/validation"
 import hashlib, json, shutil, sys
 from pathlib import Path
 import torch
 from fabledan.model_torch import export_npz, load_ckpt
 
 torch.set_num_threads(1)
-out, target, baseline = map(Path, sys.argv[1:])
+out, target, baseline, champion_dir = map(Path, sys.argv[1:])
 status = json.loads((out / "last_training.json").read_text(encoding="utf-8"))
 if status.get("training_ok") is not True or status.get("exit_code") != 0 \
         or status.get("status") != "completed":
@@ -335,7 +335,7 @@ if not all(torch.isfinite(value).all().item() for value in model.state_dict().va
     raise RuntimeError("candidate has non-finite weights")
 export_npz(model.eval(), target / "candidate.npz")
 shutil.copyfile(baseline, target / "baseline.npz")
-champion = out / "champion" / "champion.npz"
+champion = champion_dir / "champion.npz"
 if champion.exists():
     shutil.copyfile(champion, target / "previous_champion.npz")
 def digest(path):
