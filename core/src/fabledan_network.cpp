@@ -117,18 +117,24 @@ std::array<unsigned char, 32> sha256(const unsigned char* input,
         0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
         0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U}};
 
-    std::vector<unsigned char> data(input, input + input_size);
+    // Hash full blocks in place.  Only the final one or two blocks need
+    // padding; copying/reallocating the entire weight payload is wasteful.
+    const std::size_t full_bytes = input_size - input_size % 64U;
+    std::array<unsigned char, 128> tail{};
+    const std::size_t remaining = input_size - full_bytes;
+    if (remaining != 0U) std::memcpy(tail.data(), input + full_bytes, remaining);
+    tail[remaining] = 0x80U;
+    const std::size_t tail_bytes = remaining < 56U ? 64U : 128U;
     const std::uint64_t bit_count = static_cast<std::uint64_t>(input_size) * 8U;
-    data.push_back(0x80U);
-    while (data.size() % 64U != 56U) data.push_back(0U);
-    for (int shift = 56; shift >= 0; shift -= 8) {
-        data.push_back(static_cast<unsigned char>(bit_count >> shift));
+    for (unsigned int i = 0; i < 8U; ++i) {
+        tail[tail_bytes - 1U - i] = static_cast<unsigned char>(bit_count >> (8U * i));
     }
 
-    for (std::size_t offset = 0; offset < data.size(); offset += 64U) {
+    for (std::size_t offset = 0; offset < full_bytes + tail_bytes; offset += 64U) {
+        const unsigned char* data = offset < full_bytes ? input + offset : tail.data() + offset - full_bytes;
         std::array<std::uint32_t, 64> words{};
         for (unsigned int i = 0; i < 16; ++i) {
-            const std::size_t at = offset + static_cast<std::size_t>(i) * 4U;
+            const std::size_t at = static_cast<std::size_t>(i) * 4U;
             words[i] = (static_cast<std::uint32_t>(data[at]) << 24) |
                        (static_cast<std::uint32_t>(data[at + 1]) << 16) |
                        (static_cast<std::uint32_t>(data[at + 2]) << 8) |
@@ -142,22 +148,36 @@ std::array<unsigned char, 32> sha256(const unsigned char* input,
             words[i] = words[i - 16] + small_a + words[i - 7] + small_b;
         }
 
-        std::array<std::uint32_t, 8> v = state;
-        for (unsigned int i = 0; i < 64; ++i) {
-            const std::uint32_t choose = (v[4] & v[5]) ^ (~v[4] & v[6]);
-            const std::uint32_t majority = (v[0] & v[1]) ^ (v[0] & v[2]) ^
-                                            (v[1] & v[2]);
-            const std::uint32_t big_a = rotr(v[4], 6) ^ rotr(v[4], 11) ^
-                                        rotr(v[4], 25);
-            const std::uint32_t big_b = rotr(v[0], 2) ^ rotr(v[0], 13) ^
-                                        rotr(v[0], 22);
-            const std::uint32_t first = v[7] + big_a + choose + constants[i] + words[i];
+        // Named scalar state lets -O2 keep the eight SHA words in registers
+        // instead of shifting an array with a small memmove every round.
+        std::uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+        std::uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+        auto round = [](std::uint32_t ra, std::uint32_t rb, std::uint32_t rc, std::uint32_t& rd,
+                        std::uint32_t re, std::uint32_t rf, std::uint32_t rg, std::uint32_t& rh,
+                        std::uint32_t word, std::uint32_t constant) {
+            const std::uint32_t choose = (re & rf) ^ (~re & rg);
+            const std::uint32_t majority = (ra & rb) ^ (ra & rc) ^ (rb & rc);
+            const std::uint32_t big_a = rotr(re, 6) ^ rotr(re, 11) ^ rotr(re, 25);
+            const std::uint32_t big_b = rotr(ra, 2) ^ rotr(ra, 13) ^ rotr(ra, 22);
+            const std::uint32_t first = rh + big_a + choose + constant + word;
             const std::uint32_t second = big_b + majority;
-            for (int j = 7; j > 0; --j) v[static_cast<std::size_t>(j)] = v[static_cast<std::size_t>(j - 1)];
-            v[4] += first;
-            v[0] = first + second;
+            rd += first;
+            rh = first + second;
+        };
+        // Rotate argument roles instead of moving seven state words every
+        // round.  After eight rounds the named words have their original roles.
+        for (unsigned int i = 0; i < 64; i += 8) {
+            round(a, b, c, d, e, f, g, h, words[i], constants[i]);
+            round(h, a, b, c, d, e, f, g, words[i + 1], constants[i + 1]);
+            round(g, h, a, b, c, d, e, f, words[i + 2], constants[i + 2]);
+            round(f, g, h, a, b, c, d, e, words[i + 3], constants[i + 3]);
+            round(e, f, g, h, a, b, c, d, words[i + 4], constants[i + 4]);
+            round(d, e, f, g, h, a, b, c, words[i + 5], constants[i + 5]);
+            round(c, d, e, f, g, h, a, b, words[i + 6], constants[i + 6]);
+            round(b, c, d, e, f, g, h, a, words[i + 7], constants[i + 7]);
         }
-        for (std::size_t i = 0; i < state.size(); ++i) state[i] += v[i];
+        state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+        state[4] += e; state[5] += f; state[6] += g; state[7] += h;
     }
 
     std::array<unsigned char, 32> digest{};
@@ -444,12 +464,43 @@ bool FableDanNetwork::load(const std::string& path) {
             const int out = tensor.shape[0];
             const int in = tensor.shape[1];
             std::vector<float> transposed(tensor.data.size());
-            for (int o = 0; o < out; ++o) {
-                for (int i = 0; i < in; ++i) {
-                    transposed[static_cast<std::size_t>(i) * static_cast<std::size_t>(out) +
-                               static_cast<std::size_t>(o)] =
-                        tensor.data[static_cast<std::size_t>(o) * static_cast<std::size_t>(in) +
-                                    static_cast<std::size_t>(i)];
+            // Tile the transpose so both source and destination stay in
+            // cache; the large Q-head matrices otherwise stride by 4 KiB.
+            constexpr int tile = 32;
+            for (int first_o = 0; first_o < out; first_o += tile) {
+                for (int first_i = 0; first_i < in; first_i += tile) {
+#ifdef OXBOT_FABLEDAN_SSE
+                    if (out % 4 == 0 && in % 4 == 0) {
+                        for (int o = first_o; o < std::min(out, first_o + tile); o += 4) {
+                            for (int i = first_i; i < std::min(in, first_i + tile); i += 4) {
+                                const float* src = tensor.data.data() +
+                                    static_cast<std::size_t>(o) * static_cast<std::size_t>(in) +
+                                    static_cast<std::size_t>(i);
+                                __m128 a = _mm_loadu_ps(src);
+                                __m128 b = _mm_loadu_ps(src + in);
+                                __m128 c = _mm_loadu_ps(src + 2 * in);
+                                __m128 d = _mm_loadu_ps(src + 3 * in);
+                                _MM_TRANSPOSE4_PS(a, b, c, d);
+                                float* dst = transposed.data() +
+                                    static_cast<std::size_t>(i) * static_cast<std::size_t>(out) +
+                                    static_cast<std::size_t>(o);
+                                _mm_storeu_ps(dst, a);
+                                _mm_storeu_ps(dst + out, b);
+                                _mm_storeu_ps(dst + 2 * out, c);
+                                _mm_storeu_ps(dst + 3 * out, d);
+                            }
+                        }
+                        continue;
+                    }
+#endif
+                    for (int o = first_o; o < std::min(out, first_o + tile); ++o) {
+                        for (int i = first_i; i < std::min(in, first_i + tile); ++i) {
+                            transposed[static_cast<std::size_t>(i) * static_cast<std::size_t>(out) +
+                                       static_cast<std::size_t>(o)] =
+                                tensor.data[static_cast<std::size_t>(o) * static_cast<std::size_t>(in) +
+                                            static_cast<std::size_t>(i)];
+                        }
+                    }
                 }
             }
             tensor.data.swap(transposed);

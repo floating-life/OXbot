@@ -7,10 +7,12 @@ after observing the response so the child can terminate cleanly.
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import queue
 import subprocess
 import threading
+import tempfile
 
 
 KEEP_RUNNING_MARKER = ">>>BOTZONE_REQUEST_KEEP_RUNNING<<<\n"
@@ -94,6 +96,51 @@ def decide_incremental_keep_running(executable):
         process.stderr.close()
 
 
+def check_exchange_defers_loading(executable):
+    """A blocked weight FIFO must never block a rule-only exchange turn."""
+    if not hasattr(os, "mkfifo"):
+        return False
+    with tempfile.TemporaryDirectory() as folder:
+        model_path = Path(folder) / "blocked-weights.fbd"
+        os.mkfifo(model_path)
+        for stage, player in (("tribute", 1), ("return", 0)):
+            rules = {"level": "2", "tribute": 1, "first": 0, "last": 1,
+                     "resist": False, "tribute_cards": {}, "return_cards": {}}
+            deal = {"stage": "deal", "your_id": player, "deliver": list(range(27)), "global": rules}
+            payload = {"requests": [deal, {"stage": stage, "global": rules}], "responses": [[]]}
+            process = subprocess.Popen([str(executable), "--model", str(model_path)],
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True, encoding="utf-8")
+            lines = queue.Queue()
+            def read_lines():
+                for line in process.stdout:
+                    lines.put(line)
+            reader = threading.Thread(target=read_lines, daemon=True)
+            reader.start()
+            try:
+                process.stdin.write(json.dumps(payload) + "\n")
+                process.stdin.flush()
+                out = json.loads(lines.get(timeout=2))
+                assert out.get("error") is None, out
+                assert len(out["response"]) == 1 and out["response"][0] in deal["deliver"], out
+                assert "policy=stage_rules;" in out["debug"], out
+                assert "model_status=deferred;" in out["debug"], out
+                assert "model_sha=" not in out["debug"], out
+                assert lines.get(timeout=2) == KEEP_RUNNING_MARKER
+                process.stdin.close()
+                process.wait(timeout=2)
+                assert process.returncode == 0 and process.stderr.read() == ""
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                if not process.stdin.closed:
+                    process.stdin.close()
+                process.stdout.close()
+                process.stderr.close()
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bot", type=Path, default=Path("bin/oxbot"))
@@ -118,6 +165,8 @@ def main():
         assert "response" in out and "debug" in out
     decide_incremental_keep_running(args.bot)
     print("7 process protocol checks passed (marker and incremental request included)")
+    if check_exchange_defers_loading(args.bot):
+        print("2 blocked-weight exchange checks passed")
 
 
 if __name__ == "__main__":

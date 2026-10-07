@@ -228,6 +228,7 @@ class KeepProcBot:
         self.reader.start()
         self.started = False
         self.times = []
+        self.times_by_stage = {}
 
     def turn(self, request):
         if not self.started:
@@ -254,7 +255,9 @@ class KeepProcBot:
                 self.model_play_turns += 1
         resp = out["response"]
         mark = self.lines.get(timeout=self.timeout)
-        self.times.append(time.time() - t0)
+        elapsed = time.time() - t0
+        self.times.append(elapsed)
+        self.times_by_stage.setdefault(request.get("stage", "unknown"), []).append(elapsed)
         if not mark or self.MARK not in mark:
             raise RuntimeError("missing keep-running marker: %r" % mark)
         return resp
@@ -510,6 +513,7 @@ def main():
     else:
         model_b = model_a
     times_by_team = {"a": [], "b": []}
+    times_by_team_and_stage = {"a": {}, "b": {}}
     game_records = []
     played = 0
     n_err, by_scn, times, settings, failures = 0, {}, [], [], []
@@ -538,6 +542,8 @@ def main():
             for p, b in enumerate(bots):
                 times.extend(b.times)
                 times_by_team["a" if p in a_seats else "b"].extend(b.times)
+                for stage, stage_times in getattr(b, "times_by_stage", {}).items():
+                    times_by_team_and_stage["a" if p in a_seats else "b"].setdefault(stage, []).extend(stage_times)
                 if isinstance(b, KeepProcBot) and b.model_protocol == "cpp":
                     cpp_play_turns += b.play_turns
                     cpp_model_turns += b.model_play_turns
@@ -593,7 +599,13 @@ def main():
                   "turn_seconds_by_team": {
                       team: {"n": len(ts), "p50": percentile(ts, 50),
                              "p99": percentile(ts, 99), "max": max(ts) if ts else 0}
-                      for team, ts in times_by_team.items()}}
+                      for team, ts in times_by_team.items()},
+                  "turn_seconds_by_team_and_stage": {
+                      team: {stage: {"n": len(ts), "p50": percentile(ts, 50),
+                                     "p99": percentile(ts, 99), "max": max(ts)}
+                             for stage, ts in stages.items() if ts}
+                      for team, stages in times_by_team_and_stage.items()},
+                  "timing_scope": "host wall clock including IPC and CPU contention; not BotZone CPU accounting"}
         if bot_artifact is not None:
             report["bot_artifact"] = bot_artifact
         if cpp_driver or cpp_driver_b:

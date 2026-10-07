@@ -9,14 +9,27 @@
 // FBDN backend independent from the Botzone policy and mirrors tools/
 // network_probe.cpp's JSON shape:
 //   {"path":"...","tokens":[...],"features":[[...],...]}
+// Default calls reload the file; reuse=true exercises the long-running KV
+// cache. reload=true always reloads, even when reuse is enabled.
 int main() {
+    oxbot::FableDanNetwork network;
+    std::string loaded_path;
     std::string line;
     while (std::getline(std::cin, line)) {
         oxbot::json::Value out = oxbot::json::Value::make_object();
         try {
             const auto input = oxbot::json::parse(line);
-            oxbot::FableDanNetwork network;
-            out["ok"] = oxbot::json::Value(network.load(input["path"].as_string()));
+            const std::string path = input["path"].as_string();
+            const auto load_start = std::chrono::steady_clock::now();
+            if (!input["reuse"].as_bool() || !network.ready() ||
+                path != loaded_path || input["reload"].as_bool()) {
+                network.load(path);
+                loaded_path = path;
+            }
+            out["load_milliseconds"] = oxbot::json::Value(
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - load_start).count());
+            out["ok"] = oxbot::json::Value(network.ready());
             out["status"] = oxbot::json::Value(network.status());
             out["sha"] = oxbot::json::Value(network.payload_sha());
             if (network.ready()) out["feature_dim"] = oxbot::json::Value(network.feature_dim());

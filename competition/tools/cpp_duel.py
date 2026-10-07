@@ -64,11 +64,28 @@ def merge(shard_reports, deals, iters=10000, seed=0):
     play_turns = sum(r.get("cpp_model", {}).get("play_turns", 0) for r in shard_reports)
     model_turns = sum(r.get("cpp_model", {}).get("model_selected_turns", 0) for r in shard_reports)
     complete = len(pairs) == deals and errors == 0 and play_turns == model_turns
+    stage_timing = {}
+    for team in ("a", "b"):
+        stages = sorted({stage for r in shard_reports
+                         for stage in r.get("turn_seconds_by_team_and_stage", {}).get(team, {})})
+        stage_timing[team] = {}
+        for stage in stages:
+            rows = [r.get("turn_seconds_by_team_and_stage", {}).get(team, {}).get(stage)
+                    for r in shard_reports]
+            rows = [row for row in rows if row and row.get("n")]
+            stage_timing[team][stage] = {
+                "turns": sum(row["n"] for row in rows),
+                "p50_max_shard": max(row["p50"] for row in rows),
+                "p99_max_shard": max(row["p99"] for row in rows),
+                "max": max(row["max"] for row in rows),
+            }
     if not complete:
         summary["verdict"] = "INVALID"
     summary.update(judge_errors=errors, requested_deals=deals, complete=complete,
                    play_turns=play_turns, model_selected_turns=model_turns,
-                   model_sha_prefixes=shas, turn_seconds=timing)
+                   model_sha_prefixes=shas, turn_seconds=timing,
+                   turn_seconds_by_stage=stage_timing,
+                   timing_scope="host wall clock including IPC and CPU contention; not BotZone CPU accounting")
     return summary
 
 

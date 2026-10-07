@@ -27,4 +27,7 @@ for oxbot_test in smoke json_test rules_test state_test; do
     "$oxbot_root/bin/$oxbot_test"
   fi
 done
+"$oxbot_cxx" "${oxbot_flags[@]}" "$oxbot_root/core/src/fabledan_network.cpp" \
+  "$oxbot_root/tests/fabledan_hash_test.cpp" -o "$oxbot_root/bin/fabledan_hash_test"
+"$oxbot_root/bin/fabledan_hash_test"
 printf 'built %s\n' "$oxbot_root/bin/oxbot"

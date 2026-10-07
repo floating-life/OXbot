@@ -42,6 +42,22 @@ class MergeTest(unittest.TestCase):
         judged = cpp_duel.merge([shard(games(0, 3, 3) + games(1, 3, 3), errors=1)], 2, iters=100)
         self.assertEqual(judged["verdict"], "INVALID")
 
+    def test_stage_timings_preserve_counts_and_worst_shard(self):
+        first = shard(games(0, 3, 1))
+        second = shard(games(1, 2, 2))
+        first["turn_seconds_by_team_and_stage"] = {
+            "a": {"play": {"n": 3, "p50": .01, "p99": .08, "max": .1},
+                  "deal": {"n": 2, "p50": .001, "p99": .002, "max": .003}}}
+        second["turn_seconds_by_team_and_stage"] = {
+            "a": {"play": {"n": 4, "p50": .02, "p99": .07, "max": .2}}}
+        result = cpp_duel.merge([first, second], 2, iters=100)
+        stages = result["turn_seconds_by_stage"]["a"]
+        self.assertEqual(stages["play"]["turns"], 7)
+        self.assertEqual(stages["play"]["p99_max_shard"], .08)
+        self.assertEqual(stages["play"]["max"], .2)
+        self.assertEqual(stages["deal"]["turns"], 2)
+        self.assertEqual(result["turn_seconds_by_stage"]["b"], {})
+
 
 class JudgeRunnerShardTest(unittest.TestCase):
     def run_runner(self, folder, name, extra):

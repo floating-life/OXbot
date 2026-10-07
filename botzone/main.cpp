@@ -2,6 +2,7 @@
 #include "oxbot/protocol.hpp"
 
 #include <iostream>
+#include <memory>
 #include <string>
 
 namespace {
@@ -122,11 +123,8 @@ int main(int argc, char** argv) {
     std::string line;
     if (!std::getline(std::cin, line)) return 0;
 
-    // The deal response is deterministic and does not inspect model weights.
-    // Answer it before constructing the embedded ModelPolicy, then load the
-    // model while the referee is preparing the first play request.  This
-    // removes model I/O/checksum/tensor setup from BotZone's doubled 2-second
-    // first-turn budget without changing any play/tribute/return behavior.
+    // Deal and exchange use stage rules.  Defer model I/O/checksum/tensor
+    // setup until the first play rather than stalling an exchange request.
     SessionHistory session;
     bool first_line_was_deal = false;
     try {
@@ -150,10 +148,11 @@ int main(int argc, char** argv) {
         // Let the normal per-line handler below report parse/state errors.
     }
 
-    // BotZone's long-running mode keeps stdin open and sends one JSON request
-    // per line.  Construct the policy once (including model loading), then
-    // answer every line while preserving the same model/strategy identity.
-    oxbot::BotAdapter adapter(model_path, strategy, OXBOT_CANDIDATE_VERSION);
+    // Construct the loaded policy once, only when inference is needed.
+    // Rule-only phases must not wait for a weight file or start competing
+    // cold loads in every bot immediately after the deal marker.
+    oxbot::BotAdapter stage_adapter({}, strategy, OXBOT_CANDIDATE_VERSION);
+    std::unique_ptr<oxbot::BotAdapter> model_adapter;
     auto process_line = [&](const std::string& request_line) {
         oxbot::json::Value output = oxbot::json::Value::make_object();
         try {
@@ -165,12 +164,28 @@ int main(int argc, char** argv) {
             } else if (append_incremental_request(input, &session, &full_input)) {
                 replayed_session = true;
             }
-            output = adapter.decide(full_input);
+            const auto* requests = full_input.find("requests");
+            const bool play = requests && requests->is_array() && !requests->array.empty() &&
+                requests->array.back()["stage"].as_string() == "play";
+            if (play && !model_adapter) {
+                model_adapter = std::make_unique<oxbot::BotAdapter>(
+                    model_path, strategy, OXBOT_CANDIDATE_VERSION);
+            }
+            output = model_adapter ? model_adapter->decide(full_input) : stage_adapter.decide(full_input);
+            if (!model_adapter && !model_path.empty()) {
+                std::string debug = output["debug"].as_string();
+                const std::string unloaded = ";model_status=model_not_configured";
+                const std::size_t marker = debug.find(unloaded);
+                if (marker != std::string::npos) {
+                    debug.replace(marker, unloaded.size(), ";model_status=deferred");
+                    output["debug"] = oxbot::json::Value(debug);
+                }
+            }
             if (replayed_session) remember_response(&session, output);
         } catch (const std::exception& error) {
             output["response"] = oxbot::json::Value(nullptr);
             output["error"] = oxbot::json::Value("parse_or_decision_error");
-            std::string version = adapter.diagnostic_version();
+            std::string version = model_adapter ? model_adapter->diagnostic_version() : stage_adapter.diagnostic_version();
             if (version.empty()) version = "oxbot-model-v1";
             std::string message = "version=" + version + ";status=fail_closed;error=" + std::string(error.what());
             if (message.size() > 900) message.resize(900);

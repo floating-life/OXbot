@@ -515,3 +515,6 @@ GCC 7.2 严格单文件编译、完整 GCC 13 构建、7 项进程协议检查�
 2026-10-07：冠军 C++ 对 cf8 完成 500 副同牌换座，每局 +2.267，95% CI [2.187, 2.346]，裁判错误 0，模型出牌 85057/85057（100%），bot A p99 0.997020 秒、max 1.422591 秒；报告 reports/cpp_release/20261007-000651/。
 NOT RELEASED；gate_failures：cf8: candidate p99 0.997s over local limit 0.500s。
 走 B：从冠军启动第二轮 24 小时训练，输出 competition/ckpts/dmc-r2，run_id=20261007-001410-aab39940；status=running、stage=training、phase=collect，stderr 0 字节，新候选晋级必须胜过现任冠军。
+2026-10-08：第二轮 24 小时训练及评测完成并晋级，对旧冠军 1,000 副每局 +0.6625、95% CI [0.581, 0.743]，官方裁判 200 局错误 0；本地新冠军 NPZ SHA256 6f4d618959ff0c9538233f5010095c3bc2d681873093e757fdc429b16c8cee51。
+完成模型首次 play 延迟加载、流式八轮 SHA-256、分块/SSE 权重转置及分阶段诊断；36 组评分逐项一致，12 个 SHA 向量、8 项回归和 9 项进程检查通过；方案见 docs/cpp_inference_optimization.md。
+最终对 cf8 500 副仍每局 +2.485、95% CI [2.413, 2.556]、裁判错误 0；p99 从 1.040314 秒降至 0.508626 秒，仍超过 0.500 秒门槛，NOT RELEASED；报告 reports/cpp_opt_20261008/final-gate/，未上传 BotZone。
